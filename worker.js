@@ -1,223 +1,301 @@
-const HTML = `<!DOCTYPE html>
-<html lang="de">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>EO</title>
+const MODEL = "@cf/zai-org/glm-5.2";
 
-<style>
-body{
-  margin:0;
-  background:#0b0f14;
-  color:white;
-  font-family:Arial,sans-serif;
-}
+const SYSTEM = `
+Du bist EO, ein technischer Engineering-, Analyse- und Forensik-Assistent.
 
-header{
-  padding:18px;
-  background:#111820;
-  font-size:24px;
-  font-weight:bold;
-}
+GRUNDPRINZIP:
+Verstehen -> Planen -> Ausführen -> Prüfen -> erst dann Erfolg melden.
 
-#chat{
-  padding:18px;
-  height:65vh;
-  overflow-y:auto;
-}
+VERBINDLICHE REGELN:
+- Nutze nur echte Werkzeuge, die dir angeboten werden.
+- Zum Erstellen oder Aktualisieren von Projektdateien verwendest du save_file.
+- Nach mehreren Dateiänderungen verwendest du verify_files oder list_files.
+- Behaupte niemals, eine Datei gespeichert, gelöscht oder geprüft zu haben, wenn das entsprechende Werkzeug keinen erfolgreichen Rückgabewert geliefert hat.
+- Wenn ein Werkzeug fehlschlägt, nenne den echten Fehler und versuche eine sichere, sinnvolle Korrektur.
+- Erfinde niemals Werkzeugnamen, Deployments, Tests, Dateien oder Werkzeugergebnisse.
+- Wenn der Benutzer ein Programm oder eine App verlangt, plane die benötigten Dateien, speichere sie einzeln und verifiziere sie.
+- Für legitime technische Forensik darfst du Logs, Texte, Hashes, Metadaten und vom Benutzer bereitgestellte Daten defensiv untersuchen.
+- Antworte standardmäßig auf Deutsch.
+- Fasse Werkzeugergebnisse verständlich zusammen, ohne erfolgreiche Ausführung vorzutäuschen.
+`;
 
-.msg{
-  padding:14px 16px;
-  margin:10px 0;
-  border-radius:16px;
-  line-height:1.4;
-}
-
-.du{
-  background:#294057;
-}
-
-.eo{
-  background:#18232e;
-}
-
-#unten{
-  position:fixed;
-  bottom:0;
-  left:0;
-  right:0;
-  display:flex;
-  gap:10px;
-  padding:14px;
-  background:#111820;
-}
-
-input{
-  flex:1;
-  padding:15px;
-  border-radius:14px;
-  border:0;
-  font-size:16px;
-}
-
-button{
-  padding:15px 20px;
-  border:0;
-  border-radius:14px;
-  font-size:16px;
-  font-weight:bold;
-}
-</style>
-
-</head>
-
-<body>
-
-<header>EO 🤖</header>
-
-<div id="chat">
-  <div class="msg eo">
-    <b>EO:</b> Bereit. Was soll ich für dich machen?
-  </div>
-</div>
-
-<div id="unten">
-  <input id="frage" placeholder="Schreibe EO einen Befehl...">
-  <button onclick="senden()">Senden</button>
-</div>
-
-<script>
-async function senden(){
-
-  const feld = document.getElementById("frage");
-  const text = feld.value.trim();
-
-  if(!text) return;
-
-  const chat = document.getElementById("chat");
-
-  const du = document.createElement("div");
-  du.className = "msg du";
-  du.innerHTML = "<b>Du:</b> " + text;
-  chat.appendChild(du);
-
-  feld.value = "";
-
-  const warten = document.createElement("div");
-  warten.className = "msg eo";
-  warten.innerHTML = "<b>EO:</b> Denke nach...";
-  chat.appendChild(warten);
-
-  chat.scrollTop = chat.scrollHeight;
-
-  try {
-
-    const r = await fetch("/api/chat", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json"
+const TOOLS = [
+  {
+    name: "remember",
+    description: "Speichert eine Information dauerhaft im EO-Gedächtnis.",
+    parameters: {
+      type: "object",
+      properties: {
+        key: { type: "string" },
+        value: { type: "string" }
       },
-      body: JSON.stringify({
-        message: text
-      })
-    });
-
-    const data = await r.json();
-
-    warten.innerHTML =
-      "<b>EO:</b> " +
-      (data.response || data.error || "Keine Antwort erhalten.");
-
-  } catch(e) {
-
-    warten.innerHTML =
-      "<b>EO:</b> Verbindung zur KI fehlgeschlagen: " +
-      String(e.message || e);
-
+      required: ["key", "value"]
+    }
+  },
+  {
+    name: "recall",
+    description: "Sucht im dauerhaften EO-Gedächtnis.",
+    parameters: {
+      type: "object",
+      properties: { query: { type: "string" } },
+      required: ["query"]
+    }
+  },
+  {
+    name: "save_file",
+    description: "Erstellt oder aktualisiert genau eine Projektdatei und verifiziert die Speicherung.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string" },
+        path: { type: "string" },
+        content: { type: "string" },
+        language: { type: "string" }
+      },
+      required: ["project", "path", "content"]
+    }
+  },
+  {
+    name: "read_file",
+    description: "Liest eine tatsächlich gespeicherte Projektdatei.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string" },
+        path: { type: "string" }
+      },
+      required: ["project", "path"]
+    }
+  },
+  {
+    name: "list_files",
+    description: "Listet alle tatsächlich gespeicherten Dateien eines Projekts.",
+    parameters: {
+      type: "object",
+      properties: { project: { type: "string" } },
+      required: ["project"]
+    }
+  },
+  {
+    name: "delete_file",
+    description: "Löscht eine Projektdatei und verifiziert die Löschung.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string" },
+        path: { type: "string" }
+      },
+      required: ["project", "path"]
+    }
+  },
+  {
+    name: "verify_files",
+    description: "Prüft, ob eine Liste erwarteter Dateien tatsächlich im Projekt vorhanden ist.",
+    parameters: {
+      type: "object",
+      properties: {
+        project: { type: "string" },
+        paths: { type: "array", items: { type: "string" } }
+      },
+      required: ["project", "paths"]
+    }
+  },
+  {
+    name: "sha256",
+    description: "Berechnet den SHA-256-Hash für bereitgestellte Text- oder Dateninhalte.",
+    parameters: {
+      type: "object",
+      properties: { data: { type: "string" } },
+      required: ["data"]
+    }
+  },
+  {
+    name: "inspect_log",
+    description: "Untersucht bereitgestellte Log- oder Textdaten defensiv auf IPs, URLs und Fehlerindikatoren.",
+    parameters: {
+      type: "object",
+      properties: { text: { type: "string" } },
+      required: ["text"]
+    }
   }
+];
 
-  chat.scrollTop = chat.scrollHeight;
+function json(data, status = 200) {
+  return new Response(JSON.stringify(data), {
+    status,
+    headers: {
+      "content-type": "application/json; charset=UTF-8",
+      "cache-control": "no-store"
+    }
+  });
 }
 
-document.getElementById("frage").addEventListener("keydown", function(e){
-  if(e.key === "Enter"){
-    senden();
+function safeText(value, max = 200000) {
+  return String(value ?? "").slice(0, max);
+}
+
+function cleanProject(value) {
+  return safeText(value, 200).trim() || "EO";
+}
+
+function cleanPath(value) {
+  return safeText(value, 800)
+    .replace(/\\/g, "/")
+    .replace(/^\/+/, "")
+    .replace(/\.{2,}/g, ".")
+    .trim();
+}
+
+function normalizeArgs(call) {
+  if (!call) return {};
+  if (typeof call.arguments === "string") {
+    try { return JSON.parse(call.arguments); }
+    catch { return {}; }
   }
-});
-</script>
+  return call.arguments || {};
+}
 
-</body>
-</html>`;
+function canonicalToolName(name) {
+  if (["create_file", "write_file", "update_file"].includes(name)) return "save_file";
+  return name;
+}
 
-export default {
+async function ensureSchema(env) {
+  if (!env.DB) return false;
 
-  async fetch(request, env) {
+  await env.DB.batch([
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        key TEXT UNIQUE NOT NULL,
+        value TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS projects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        name TEXT UNIQUE NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS files (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        project_name TEXT NOT NULL,
+        path TEXT NOT NULL,
+        content TEXT NOT NULL,
+        language TEXT DEFAULT '',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(project_name, path)
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS uploads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        object_key TEXT UNIQUE NOT NULL,
+        file_name TEXT NOT NULL,
+        content_type TEXT DEFAULT '',
+        bytes INTEGER DEFAULT 0,
+        storage TEXT NOT NULL,
+        project_name TEXT DEFAULT 'EO',
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `)
+  ]);
 
-    const url = new URL(request.url);
+  return true;
+}
 
-    if(url.pathname === "/api/chat" && request.method === "POST") {
+async function saveFile(env, args) {
+  if (!env.DB) return { ok: false, tool: "save_file", error: "D1-Bindung DB fehlt." };
 
-      try {
+  const project = cleanProject(args.project);
+  const path = cleanPath(args.path);
+  const content = safeText(args.content, 500000);
+  const language = safeText(args.language, 80);
 
-        const body = await request.json();
+  if (!path) return { ok: false, tool: "save_file", error: "Dateipfad fehlt." };
 
-        const message =
-          String(body.message || "").trim();
+  await env.DB.prepare(`
+    INSERT INTO projects(name) VALUES(?)
+    ON CONFLICT(name) DO UPDATE SET updated_at=CURRENT_TIMESTAMP
+  `).bind(project).run();
 
-        if(!message) {
+  const result = await env.DB.prepare(`
+    INSERT INTO files(project_name, path, content, language)
+    VALUES(?, ?, ?, ?)
+    ON CONFLICT(project_name, path) DO UPDATE SET
+      content=excluded.content,
+      language=excluded.language,
+      updated_at=CURRENT_TIMESTAMP
+  `).bind(project, path, content, language).run();
 
-          return Response.json(
-            {
-              error: "Keine Nachricht erhalten."
-            },
-            {
-              status: 400
-            }
-          );
-        }
+  const check = await env.DB.prepare(`
+    SELECT project_name, path, language, length(content) AS bytes, updated_at
+    FROM files WHERE project_name=? AND path=?
+  `).bind(project, path).first();
 
-        if(!env.AI) {
+  return {
+    ok: !!result.success && !!check,
+    tool: "save_file",
+    project,
+    path,
+    verified: !!check,
+    stored: check || null
+  };
+}
 
-          return Response.json(
-            {
-              error: "AI-Bindung fehlt.",
-              response: "KI-Fehler: Die Workers-AI-Bindung AI wurde nicht gefunden."
-            },
-            {
-              status: 500
-            }
-          );
-        }
+async function runTool(env, requestedName, args) {
+  const name = canonicalToolName(requestedName);
 
-        const result = await env.AI.run(
-          "@cf/meta/llama-3.1-8b-instruct",
-          {
-            messages: [
-              {
-                role: "system",
-                content:
-                  "Du bist EO, ein hilfreicher KI-Assistent. Antworte standardmäßig auf Deutsch, klar und verständlich."
-              },
-              {
-                role: "user",
-                content: message
-              }
-            ]
-          }
-        );
+  switch (name) {
+    case "remember": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const key = safeText(args.key, 500).trim();
+      const value = safeText(args.value, 50000);
+      if (!key) return { ok: false, tool: name, error: "Leerer Schlüssel." };
 
-        return Response.json({
-          response:
-            result?.response ||
-            "Ich konnte darauf gerade keine Antwort erzeugen."
-        });
+      const result = await env.DB.prepare(`
+        INSERT INTO memories(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
+      `).bind(key, value).run();
 
-      } catch(error) {
+      return { ok: !!result.success, tool: name, key };
+    }
 
-        return Response.json(
-          {
-            error: "KI-Fehler",
-            response:
-              "KI-Fehler: " +
-              String(error?.message || error)
-          },
+    case "recall": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const query = safeText(args.query, 1000).trim();
+      const q = `%${query}%`;
+      const result = await env.DB.prepare(`
+        SELECT key, value, updated_at
+        FROM memories
+        WHERE key LIKE ? OR value LIKE ?
+        ORDER BY updated_at DESC LIMIT 30
+      `).bind(q, q).all();
+      return { ok: true, tool: name, results: result.results || [] };
+    }
+
+    case "save_file":
+      return saveFile(env, args);
+
+    case "read_file": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const project = cleanProject(args.project);
+      const path = cleanPath(args.path);
+      const file = await env.DB.prepare(`
+        SELECT project_name, path, content, language, updated_at
+        FROM files WHERE project_name=? AND path=?
+      `).bind(project, path).first();
+
+      return file
+        ? { ok: true, tool: name, file }
+        : { ok: false, tool: name, error: "Datei nicht gefunden.", project, path };
+    }
+
+    case "list_files": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt
