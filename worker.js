@@ -908,7 +908,7 @@ async function askEO(env, incomingMessages) {
     const response = await env.AI.run(MODEL, {
       messages,
       tools: TOOLS,
-      max_tokens: 4096
+      max_completion_tokens: 4096
     });
 
     const toolCalls = Array.isArray(response?.tool_calls) ? response.tool_calls : [];
