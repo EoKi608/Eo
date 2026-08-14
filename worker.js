@@ -1,4 +1,5 @@
-const MODEL = "@cf/zai-org/glm-5.2";
+// ===== EO BLOCK 1/10 =====
+const MODEL = "@cf/zai-org/glm-4.7-flash";
 
 const SYSTEM = `
 Du bist EO, ein technischer Engineering-, Analyse- und Forensik-Assistent.
@@ -108,6 +109,7 @@ const TOOLS = [
     description: "Listet alle gespeicherten EO-Projekte auf.",
     parameters: { type: "object", properties: {} }
   },
+// ===== ENDE BLOCK 1/10 =====// ===== EO BLOCK 2/10 =====
   {
     name: "create_project",
     description: "Legt ein Projekt ausdrücklich an.",
@@ -217,6 +219,7 @@ const TOOLS = [
       required: ["project", "path"]
     }
   },
+// ===== ENDE BLOCK 2/10 =====// ===== EO BLOCK 3/10 =====
   {
     name: "validate_project",
     description: "Prüft ein Projekt auf leere Dateien und einfache HTML/CSS/JS-Strukturprobleme. Dies ist eine statische Prüfung, kein echter Build.",
@@ -335,12 +338,13 @@ function normalizeArgs(call) {
 }
 
 function canonicalToolName(name) {
-  if (["create_file", "write_file", "update_file"].includes(name)) {
-    return "save_file";
-  }
-
+  // Kompatibilität gegen den alten EO-Fehler, ohne beliebige erfundene Tools zu akzeptieren.
+  if (["create_file", "write_file", "update_file"].includes(name)) return "save_file";
   return name;
-  }async function ensureSchema(env) {
+}
+
+// ===== ENDE BLOCK 3/10 =====// ===== EO BLOCK 4/10 =====
+async function ensureSchema(env) {
   if (!env.DB) return false;
 
   await env.DB.batch([
@@ -386,6 +390,14 @@ function canonicalToolName(name) {
       )
     `),
     env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS chat_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP
+      )
+    `),
+    env.DB.prepare(`
       CREATE TABLE IF NOT EXISTS eo_updates (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         code TEXT NOT NULL,
@@ -395,14 +407,6 @@ function canonicalToolName(name) {
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         deployed_at TEXT
       )
-    `),
-    env.DB.prepare(`
-      CREATE TABLE IF NOT EXISTS chat_history (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        role TEXT NOT NULL,
-        content TEXT NOT NULL,
-        created_at TEXT DEFAULT CURRENT_TIMESTAMP
-      )
     `)
   ]);
 
@@ -410,53 +414,32 @@ function canonicalToolName(name) {
 }
 
 async function saveFile(env, args) {
-  if (!env.DB) {
-    return {
-      ok: false,
-      tool: "save_file",
-      error: "D1-Bindung DB fehlt."
-    };
-  }
+  if (!env.DB) return { ok: false, tool: "save_file", error: "D1-Bindung DB fehlt." };
 
   const project = cleanProject(args.project);
   const path = cleanPath(args.path);
   const content = safeText(args.content, 500000);
   const language = safeText(args.language, 80);
 
-  if (!path) {
-    return {
-      ok: false,
-      tool: "save_file",
-      error: "Dateipfad fehlt."
-    };
-  }
+  if (!path) return { ok: false, tool: "save_file", error: "Dateipfad fehlt." };
 
   await env.DB.prepare(`
-    INSERT INTO projects(name)
-    VALUES(?)
-    ON CONFLICT(name)
-    DO UPDATE SET updated_at=CURRENT_TIMESTAMP
+    INSERT INTO projects(name) VALUES(?)
+    ON CONFLICT(name) DO UPDATE SET updated_at=CURRENT_TIMESTAMP
   `).bind(project).run();
 
   const result = await env.DB.prepare(`
     INSERT INTO files(project_name, path, content, language)
     VALUES(?, ?, ?, ?)
-    ON CONFLICT(project_name, path)
-    DO UPDATE SET
+    ON CONFLICT(project_name, path) DO UPDATE SET
       content=excluded.content,
       language=excluded.language,
       updated_at=CURRENT_TIMESTAMP
   `).bind(project, path, content, language).run();
 
   const check = await env.DB.prepare(`
-    SELECT
-      project_name,
-      path,
-      language,
-      length(content) AS bytes,
-      updated_at
-    FROM files
-    WHERE project_name=? AND path=?
+    SELECT project_name, path, language, length(content) AS bytes, updated_at
+    FROM files WHERE project_name=? AND path=?
   `).bind(project, path).first();
 
   return {
@@ -469,256 +452,89 @@ async function saveFile(env, args) {
   };
 }
 
-async function textSha256(text) {
-  const bytes = new TextEncoder().encode(String(text ?? ""));
+
+async function textSha256(data) {
+  const bytes = new TextEncoder().encode(String(data ?? ""));
   const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return [...new Uint8Array(digest)]
-    .map(byte => byte.toString(16).padStart(2, "0"))
-    .join("");
+  return [...new Uint8Array(digest)].map(x => x.toString(16).padStart(2, "0")).join("");
 }
 
-function isPrivateHostname(hostname) {
-  const host = String(hostname || "").toLowerCase();
-
+function publicHttpsUrl(value) {
+  let u;
+  try { u = new URL(String(value || "")); } catch { return null; }
+  if (u.protocol !== "https:") return null;
+  const h = u.hostname.toLowerCase();
   if (
-    host === "localhost" ||
-    host === "127.0.0.1" ||
-    host === "::1" ||
-    host.endsWith(".local")
-  ) {
-    return true;
-  }
-
-  const ipv4 = host.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
-
-  if (ipv4) {
-    const parts = ipv4.slice(1).map(Number);
-
-    if (parts.some(part => part < 0 || part > 255)) return true;
-    if (parts[0] === 10) return true;
-    if (parts[0] === 127) return true;
-    if (parts[0] === 169 && parts[1] === 254) return true;
-    if (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) return true;
-    if (parts[0] === 192 && parts[1] === 168) return true;
-  }
-
-  return false;
+    h === "localhost" || h === "0.0.0.0" || h === "::1" ||
+    h.endsWith(".local") || h.endsWith(".internal") ||
+    /^127\./.test(h) || /^10\./.test(h) || /^192\.168\./.test(h) ||
+    /^169\.254\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)
+  ) return null;
+  return u;
 }
 
+// ===== ENDE BLOCK 4/10 =====// ===== EO BLOCK 5/10 =====
 async function runTool(env, requestedName, args) {
   const name = canonicalToolName(requestedName);
 
   switch (name) {
     case "remember": {
-      if (!env.DB) {
-        return {
-          ok: false,
-          tool: name,
-          error: "D1-Bindung DB fehlt."
-        };
-      }
-
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const key = safeText(args.key, 500).trim();
       const value = safeText(args.value, 50000);
-
-      if (!key) {
-        return {
-          ok: false,
-          tool: name,
-          error: "Leerer Schlüssel."
-        };
-      }
+      if (!key) return { ok: false, tool: name, error: "Leerer Schlüssel." };
 
       const result = await env.DB.prepare(`
-        INSERT INTO memories(key, value)
-        VALUES(?, ?)
-        ON CONFLICT(key)
-        DO UPDATE SET
-          value=excluded.value,
-          updated_at=CURRENT_TIMESTAMP
+        INSERT INTO memories(key, value) VALUES(?, ?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=CURRENT_TIMESTAMP
       `).bind(key, value).run();
 
-      return {
-        ok: !!result.success,
-        tool: name,
-        key
-      };
+      return { ok: !!result.success, tool: name, key };
     }
 
     case "recall": {
-      if (!env.DB) {
-        return {
-          ok: false,
-          tool: name,
-          error: "D1-Bindung DB fehlt."
-        };
-      }
-
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const query = safeText(args.query, 1000).trim();
       const q = `%${query}%`;
-
       const result = await env.DB.prepare(`
         SELECT key, value, updated_at
         FROM memories
         WHERE key LIKE ? OR value LIKE ?
-        ORDER BY updated_at DESC
-        LIMIT 30
+        ORDER BY updated_at DESC LIMIT 30
       `).bind(q, q).all();
-
-      return {
-        ok: true,
-        tool: name,
-        results: result.results || []
-      };
+      return { ok: true, tool: name, results: result.results || [] };
     }
 
     case "save_file":
       return saveFile(env, args);
 
     case "read_file": {
-      if (!env.DB) {
-        return {
-          ok: false,
-          tool: name,
-          error: "D1-Bindung DB fehlt."
-        };
-      }
-
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const project = cleanProject(args.project);
       const path = cleanPath(args.path);
-
       const file = await env.DB.prepare(`
-        SELECT content, language, created_at, updated_at
-        FROM files
-        WHERE project_name=? AND path=?
+        SELECT project_name, path, content, language, updated_at
+        FROM files WHERE project_name=? AND path=?
       `).bind(project, path).first();
-
-      if (!file) {
-        return {
-          ok: false,
-          tool: name,
-          error: "Datei nicht gefunden.",
-          project,
-          path
-        };
-      }
-
-      return {
-        ok: true,
-        tool: name,
-        project,
-        path,
-        file
-      };
+      return file
+        ? { ok: true, tool: name, file }
+        : { ok: false, tool: name, error: "Datei nicht gefunden.", project, path };
     }
 
     case "list_files": {
-      if (!env.DB) {
-        return {
-          ok: false,
-          tool: name,
-          error: "D1-Bindung DB fehlt."
-        };
-      }
-
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const project = cleanProject(args.project);
-
       const result = await env.DB.prepare(`
-        SELECT
-          path,
-          language,
-          length(content) AS bytes,
-          created_at,
-          updated_at
-        FROM files
-        WHERE project_name=?
-        ORDER BY path
+        SELECT path, language, length(content) AS bytes, updated_at
+        FROM files WHERE project_name=? ORDER BY path
       `).bind(project).all();
-
-      return {
-        ok: true,
-        tool: name,
-        project,
-        files: result.results || []
-      };
+      const files = result.results || [];
+      return { ok: true, tool: name, project, files, count: files.length };
     }
 
     case "delete_file": {
-      if (!env.DB) {
-        return {
-          ok: false,
-          tool: name,
-          error: "D1-Bindung DB fehlt."
-        };
-      }
-
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const project = cleanProject(args.project);
-      const path = cleanPath(args.path);
-
-      const result = await env.DB.prepare(`
-        DELETE FROM files
-        WHERE project_name=? AND path=?
-      `).bind(project, path).run();
-
-      const check = await env.DB.prepare(`
-        SELECT path
-        FROM files
-        WHERE project_name=? AND path=?
-      `).bind(project, path).first();
-
-      return {
-        ok: !!result.success && !check,
-        tool: name,
-        project,
-        path,
-        verified_deleted: !check
-      };
-    }
-
-    case "verify_files": {
-      if (!env.DB) {
-        return {
-          ok: false,
-          tool: name,
-          error: "D1-Bindung DB fehlt."
-        };
-      }
-
-      const project = cleanProject(args.project);
-      const requested = Array.isArray(args.paths)
-        ? args.paths.map(cleanPath).filter(Boolean)
-        : [];
-
-      if (!requested.length) {
-        return {
-          ok: false,
-          tool: name,
-          error: "Keine Dateipfade zum Prüfen übergeben."
-        };
-      }
-
-      const result = await env.DB.prepare(`
-        SELECT path, length(content) AS bytes, updated_at
-        FROM files
-        WHERE project_name=?
-        ORDER BY path
-      `).bind(project).all();
-
-      const actual = result.results || [];
-      const names = new Set(actual.map(item => item.path));
-      const present = requested.filter(item => names.has(item));
-      const missing = requested.filter(item => !names.has(item));
-
-      return {
-        ok: missing.length === 0,
-        tool: name,
-        project,
-        requested,
-        present,
-        missing,
-        actual
-      };
-    }      const project = cleanProject(args.project);
       const path = cleanPath(args.path);
       const result = await env.DB.prepare(`DELETE FROM files WHERE project_name=? AND path=?`)
         .bind(project, path).run();
@@ -761,6 +577,7 @@ async function runTool(env, requestedName, args) {
         actual
       };
     }
+// ===== ENDE BLOCK 5/10 =====// ===== EO BLOCK 6/10 =====
 
     case "list_projects": {
       if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
@@ -926,6 +743,7 @@ async function runTool(env, requestedName, args) {
         note: "Statische Prüfung; kein echter Compiler/Build wurde ausgeführt."
       };
     }
+// ===== ENDE BLOCK 6/10 =====// ===== EO BLOCK 7/10 =====
 
     case "http_request": {
       const u = publicHttpsUrl(args.url);
@@ -973,7 +791,8 @@ async function runTool(env, requestedName, args) {
         ok: true,
         tool: name,
         candidate: candidate || null,
-        deployment_ready: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_WORKER_NAME),        required_secrets: {
+        deployment_ready: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_WORKER_NAME),
+        required_secrets: {
           CF_API_TOKEN: !!env.CF_API_TOKEN,
           CF_ACCOUNT_ID: !!env.CF_ACCOUNT_ID,
           CF_WORKER_NAME: !!env.CF_WORKER_NAME
@@ -1040,6 +859,14 @@ async function runTool(env, requestedName, args) {
       };
     }
 
+    case "clear_history": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      if (String(args.confirm || "") !== "CLEAR HISTORY")
+        return { ok: false, tool: name, error: "Bestätigung CLEAR HISTORY fehlt." };
+      const result = await env.DB.prepare(`DELETE FROM chat_history`).run();
+      return { ok: !!result.success, tool: name, cleared: true };
+    }
+
     case "sha256": {
       const hash = await textSha256(safeText(args.data, 500000));
       return { ok: true, tool: name, algorithm: "SHA-256", hash };
@@ -1071,6 +898,7 @@ async function runTool(env, requestedName, args) {
   }
 }
 
+// ===== ENDE BLOCK 7/10 =====// ===== EO BLOCK 8/10 =====
 async function askEO(env, incomingMessages) {
   const messages = [{ role: "system", content: SYSTEM }, ...incomingMessages];
   const audit = [];
@@ -1217,6 +1045,7 @@ async function listUploads(env) {
   return json({ ok: true, uploads: result.results || [] });
 }
 
+// ===== ENDE BLOCK 8/10 =====// ===== EO BLOCK 9/10 =====
 const HTML = `<!DOCTYPE html>
 <html lang="de">
 <head>
@@ -1228,7 +1057,8 @@ const HTML = `<!DOCTYPE html>
 :root{--bg:#080d12;--panel:#101820;--panel2:#131d26;--line:#263746;--blue:#2196f3;--text:#fff;--muted:#94a8bb;--red:#8f2525;--green:#60c98a}
 body{margin:0;background:var(--bg);color:var(--text);font-family:Arial,sans-serif}
 header{padding:14px 15px;background:var(--panel);border-bottom:1px solid var(--line);position:sticky;top:0;z-index:10}
-.top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}.logo{font-size:27px;font-weight:800}
+.top{display:flex;justify-content:space-between;gap:10px;align-items:flex-start}
+.logo{font-size:27px;font-weight:800}
 .sub{font-size:12px;color:var(--muted);margin-top:3px}
 #status{font-size:12px;color:#87cfff;margin-top:8px;line-height:1.45}
 #chat{padding:14px;padding-bottom:270px;min-height:100vh;box-sizing:border-box}
@@ -1238,7 +1068,7 @@ header{padding:14px 15px;background:var(--panel);border-bottom:1px solid var(--l
 .audit{font-size:12px;color:#9fc6e5;border-top:1px solid #2b4052;margin-top:10px;padding-top:8px}
 .bottom{position:fixed;left:0;right:0;bottom:0;background:#0d151d;border-top:1px solid var(--line);padding:9px;z-index:20}
 .actions{display:flex;gap:7px;margin-bottom:7px}
-.actions button{height:38px;flex:1;background:#172431;border:1px solid #304353}
+.actions button{height:38px;flex:1;min-width:0;background:#172431;border:1px solid #304353;font-size:11px}
 .controls{display:flex;gap:7px}
 textarea{flex:1;height:74px;resize:none;background:#111c25;color:#fff;border:1px solid #304353;border-radius:10px;padding:10px;font-size:15px}
 button{border:0;border-radius:10px;color:#fff;font-weight:700;padding:0 10px}
@@ -1266,7 +1096,7 @@ button{border:0;border-radius:10px;color:#fff;font-weight:700;padding:0 10px}
 </header>
 
 <div id="chat">
-  <div class="msg ai">EO V4 ist bereit.\n\nIch kann Projekte planen, Dateien erstellen/lesen/kopieren/verschieben/löschen und verifizieren, Projekte durchsuchen, Gedächtnis verwalten, Hashes und Logs analysieren, öffentliche HTTPS-APIs abrufen und vorbereitete EO-Updates kontrolliert deployen.</div>
+  <div class="msg ai">EO V4 ist bereit.\n\nIch kann Projekte planen, Dateien erstellen/lesen/kopieren/verschieben/löschen und verifizieren, Projekte durchsuchen, Gedächtnis verwalten, Hashes und Logs analysieren, öffentliche HTTPS-APIs abrufen und vorbereitete EO-Updates kontrolliert deployen. Dateien kannst du über HOCHLADEN senden; den sichtbaren Chat kannst du über VERLAUF löschen.</div>
 </div>
 
 <div id="uploadPanel" class="panel">
@@ -1290,6 +1120,7 @@ button{border:0;border-radius:10px;color:#fff;font-weight:700;padding:0 10px}
   <div class="actions">
     <button onclick="togglePanel('uploadPanel')">📎 HOCHLADEN</button>
     <button onclick="togglePanel('filesPanel')">📁 DATEIEN</button>
+    <button onclick="clearChat()">🗑 VERLAUF</button>
   </div>
   <div class="controls">
     <textarea id="input" placeholder="Schreibe EO einen Auftrag..."></textarea>
@@ -1385,6 +1216,13 @@ async function sendMessage(){
   }finally{controller=null;running(false)}
 }
 
+async function clearChat(){
+  if(!confirm("EO-Chatverlauf auf diesem Gerät löschen? Projektdateien und Gedächtnis bleiben erhalten."))return;
+  history=[];
+  chat.innerHTML='<div class="msg ai">EO V4 ist bereit. Verlauf wurde auf diesem Gerät gelöscht.</div>';
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+
 async function uploadFile(){
   const f=document.getElementById("fileInput").files[0];
   const out=document.getElementById("uploadResult");
@@ -1423,6 +1261,7 @@ loadStatus();
 </body>
 </html>`;
 
+// ===== ENDE BLOCK 9/10 =====// ===== EO BLOCK 10/10 =====
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -1484,3 +1323,4 @@ export default {
     }
   }
 };
+// ===== ENDE BLOCK 10/10 =====
