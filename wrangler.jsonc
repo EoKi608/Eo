@@ -2,7 +2,16 @@
   "name": "eo",
   "main": "worker.js",
   "compatibility_date": "2026-08-11",
+
   "ai": {
     "binding": "AI"
-  }
+  },
+
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "eo-db",
+      "database_id": "7d9ed350-256d-4b8e-a539-69be7a71e562"
+    }
+  ]
 }
