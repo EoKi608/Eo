@@ -1110,157 +1110,369 @@ button{border:0;border-radius:10px;color:#fff;font-weight:700;padding:0 10px}
 </div>
 
 <div id="filesPanel" class="panel">
-  <button class="close" onclick="togglePanel('filesPanel',false)">✕</button>
-  <h3>📁 Projektdateien</h3>
-  <div class="row"><input id="filesProject" value="EO-Testprojekt" placeholder="Projektname"><button style="background:#2196f3" onclick="loadFiles()">ANZEIGEN</button></div>
-  <div id="filesResult" class="small">Projekt eingeben und ANZEIGEN drücken.</div>
-</div>
+// ===== EO BLOCK 8/10 =====
 
-<div class="bottom">
-  <div class="actions">
-    <button onclick="togglePanel('uploadPanel')">📎 HOCHLADEN</button>
-    <button onclick="togglePanel('filesPanel')">📁 DATEIEN</button>
-    <button onclick="clearChat()">🗑 VERLAUF</button>
-  </div>
-  <div class="controls">
-    <textarea id="input" placeholder="Schreibe EO einen Auftrag..."></textarea>
-    <button id="send" onclick="sendMessage()">SENDEN</button>
-    <button id="stop" onclick="stopEO()" disabled>STOP</button>
-  </div>
-</div>
-
-<script>
-const chat=document.getElementById("chat");
-const input=document.getElementById("input");
-const sendButton=document.getElementById("send");
-const stopButton=document.getElementById("stop");
-let history=[];
-let controller=null;
-let loading=null;
-
-function add(text,type,audit){
-  const d=document.createElement("div");
-  d.className="msg "+type;
-  const body=document.createElement("div");
-  body.textContent=text;
-  d.appendChild(body);
-  if(Array.isArray(audit)&&audit.length){
-    const a=document.createElement("div");
-    a.className="audit";
-    a.textContent="Tatsächlich ausgeführt: "+audit.map(x=>{
-      const ok=x&&x.result&&x.result.ok===true?"✓":"✕";
-      const renamed=x.requested_name&&x.requested_name!==x.name?" ("+x.requested_name+"→"+x.name+")":"";
-      return ok+" "+(x.name||x.requested_name||"tool")+renamed;
-    }).join(" · ");
-    d.appendChild(a);
+async function askEO(env, incomingMessages) {
+  if (!env.AI) {
+    return {
+      reply: "Workers-AI-Bindung AI fehlt.",
+      tools: []
+    };
   }
-  chat.appendChild(d);
-  window.scrollTo({top:document.body.scrollHeight,behavior:"smooth"});
-  return d;
-}
 
-function running(state){sendButton.disabled=state;stopButton.disabled=!state}
+  const messages = [
+    { role: "system", content: SYSTEM },
+    ...incomingMessages
+      .filter(m => m && (m.role === "user" || m.role === "assistant"))
+      .map(m => ({
+        role: m.role,
+        content: safeText(m.content, 200000)
+      }))
+  ];
 
-function stopEO(){
-  if(!controller)return;
-  controller.abort();
-  controller=null;
-  running(false);
-  if(loading){loading.remove();loading=null}
-  add("⛔ Laufende Anfrage wurde im Browser gestoppt.","ai");
-}
+  const audit = [];
+  const MAX_ROUNDS = 10;
 
-function togglePanel(id,force){
-  for(const p of document.querySelectorAll(".panel")){
-    if(p.id!==id)p.classList.remove("show");
-  }
-  const el=document.getElementById(id);
-  if(force===false)el.classList.remove("show");
-  else el.classList.toggle("show");
-}
-
-async function loadStatus(){
-  try{
-    const r=await fetch("/api/status",{cache:"no-store"});
-    const j=await r.json();
-    document.getElementById("status").textContent=
-      (j.ai?"AI ✓":"AI ✕")+" | "+(j.db?"DB ✓":"DB ✕")+" | "+(j.media?"MEDIA ✓":"MEDIA –")+" | "+(j.self_update?"UPDATE ✓":"UPDATE –")+" | V"+(j.version||"?");
-  }catch{document.getElementById("status").textContent="Statusfehler"}
-}
-
-async function sendMessage(){
-  const text=input.value.trim();
-  if(!text||controller)return;
-  input.value="";
-  add(text,"user");
-  history.push({role:"user",content:text});
-  loading=add("EO arbeitet …","ai");
-  controller=new AbortController();
-  running(true);
-  try{
-    const r=await fetch("/api/chat",{
-      method:"POST",
-      headers:{"content-type":"application/json"},
-      body:JSON.stringify({messages:history.slice(-20)}),
-      signal:controller.signal
+  for (let round = 0; round < MAX_ROUNDS; round++) {
+    const response = await env.AI.run(MODEL, {
+      messages,
+      tools: TOOLS,
+      tool_choice: "auto",
+      max_tokens: 4096
     });
-    const data=await r.json();
-    if(loading){loading.remove();loading=null}
-    if(!r.ok){add("Fehler: "+(data.error||r.status),"ai");return}
-    const answer=data.reply||"Keine Antwort.";
-    add(answer,"ai",data.tools);
-    history.push({role:"assistant",content:answer});
-  }catch(error){
-    if(loading){loading.remove();loading=null}
-    if(error.name!=="AbortError")add("Verbindungsfehler: "+error.message,"ai");
-  }finally{controller=null;running(false)}
+
+    const toolCalls = Array.isArray(response?.tool_calls)
+      ? response.tool_calls
+      : [];
+
+    if (!toolCalls.length) {
+      return {
+        reply:
+          response?.response ||
+          response?.result ||
+          "EO hat keine Textantwort geliefert.",
+        tools: audit
+      };
+    }
+
+    const roundResults = [];
+
+    for (const call of toolCalls.slice(0, 12)) {
+      const requestedName =
+        call?.name ||
+        call?.function?.name ||
+        "";
+
+      let rawArguments =
+        call?.arguments ??
+        call?.function?.arguments ??
+        {};
+
+      let args = {};
+
+      if (typeof rawArguments === "string") {
+        try {
+          args = JSON.parse(rawArguments);
+        } catch {
+          args = {};
+        }
+      } else if (
+        rawArguments &&
+        typeof rawArguments === "object"
+      ) {
+        args = rawArguments;
+      }
+
+      let result;
+
+      try {
+        result = await runTool(
+          env,
+          requestedName,
+          args
+        );
+      } catch (error) {
+        result = {
+          ok: false,
+          tool: requestedName,
+          error:
+            error?.message ||
+            String(error)
+        };
+      }
+
+      const entry = {
+        requested_name: requestedName,
+        name: canonicalToolName(requestedName),
+        arguments: args,
+        result
+      };
+
+      audit.push(entry);
+      roundResults.push(entry);
+    }
+
+    /*
+      Werkzeugergebnisse werden bewusst als normale
+      Gesprächsnachricht zurückgegeben.
+
+      Dadurch vermeiden wir ungültige Tool-Roundtrip-
+      Nachrichten ohne passende tool_call_id.
+    */
+
+    messages.push({
+      role: "assistant",
+      content:
+        response?.response ||
+        "Ich habe Werkzeuge angefordert."
+    });
+
+    messages.push({
+      role: "user",
+      content:
+        "EO-WERKZEUGERGEBNISSE:\n" +
+        JSON.stringify(roundResults) +
+        "\n\nNutze diese echten Ergebnisse. " +
+        "Wenn weitere Werkzeuge nötig sind, rufe sie auf. " +
+        "Wenn der Auftrag erledigt ist, antworte dem Benutzer."
+    });
+  }
+
+  return {
+    reply:
+      "EO hat das maximale Werkzeuglimit erreicht. " +
+      "Prüfe das Werkzeugprotokoll; nicht bestätigte Schritte gelten nicht als erledigt.",
+    tools: audit
+  };
 }
 
-async function clearChat(){
-  if(!confirm("EO-Chatverlauf auf diesem Gerät löschen? Projektdateien und Gedächtnis bleiben erhalten."))return;
-  history=[];
-  chat.innerHTML='<div class="msg ai">EO V4 ist bereit. Verlauf wurde auf diesem Gerät gelöscht.</div>';
-  window.scrollTo({top:0,behavior:"smooth"});
+function isTextLike(type, name) {
+  const t = (type || "").toLowerCase();
+  const n = (name || "").toLowerCase();
+
+  return (
+    t.startsWith("text/") ||
+    [
+      "application/json",
+      "application/xml",
+      "application/javascript"
+    ].includes(t) ||
+    /\.(txt|md|csv|json|js|mjs|cjs|ts|tsx|jsx|html|htm|css|xml|yml|yaml|py|java|c|cpp|h|hpp|go|rs|php|sql|log)$/i.test(n)
+  );
 }
 
-async function uploadFile(){
-  const f=document.getElementById("fileInput").files[0];
-  const out=document.getElementById("uploadResult");
-  if(!f){out.textContent="Bitte zuerst eine Datei auswählen.";return}
-  const fd=new FormData();
-  fd.append("file",f);
-  fd.append("project",document.getElementById("uploadProject").value||"Uploads");
-  out.textContent="Upload läuft …";
-  try{
-    const r=await fetch("/api/upload",{method:"POST",body:fd});
-    const j=await r.json();
-    if(j.ok){out.innerHTML='<span class="good">✓ Verifiziert gespeichert: '+escapeHtml(j.file)+' · '+escapeHtml(j.storage)+'</span>'}
-    else{out.innerHTML='<span class="bad">✕ '+escapeHtml(j.error||"Uploadfehler")+'</span>'}
-  }catch(e){out.textContent="Uploadfehler: "+e.message}
+async function handleUpload(request, env) {
+  if (!env.DB) {
+    return json(
+      {
+        ok: false,
+        error: "D1-Bindung DB fehlt."
+      },
+      500
+    );
+  }
+
+  await ensureSchema(env);
+
+  const form = await request.formData();
+  const file = form.get("file");
+  const project = cleanProject(
+    form.get("project") || "Uploads"
+  );
+
+  if (!(file instanceof File)) {
+    return json(
+      {
+        ok: false,
+        error: "Keine Datei empfangen."
+      },
+      400
+    );
+  }
+
+  if (!file.name) {
+    return json(
+      {
+        ok: false,
+        error: "Dateiname fehlt."
+      },
+      400
+    );
+  }
+
+  const contentType =
+    file.type || "application/octet-stream";
+
+  const objectKey =
+    `${Date.now()}-${crypto.randomUUID()}-` +
+    file.name.replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_"
+    );
+
+  // Text/Code bis 500 KB direkt in D1 speichern.
+  if (
+    isTextLike(contentType, file.name) &&
+    file.size <= 500000
+  ) {
+    const text = await file.text();
+
+    const saved = await saveFile(env, {
+      project,
+      path: file.name,
+      content: text,
+      language: contentType
+    });
+
+    if (!saved.ok) {
+      return json(
+        {
+          ok: false,
+          error:
+            "Textdatei konnte nicht verifiziert gespeichert werden.",
+          saved
+        },
+        500
+      );
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO uploads(
+        object_key,
+        file_name,
+        content_type,
+        bytes,
+        storage,
+        project_name
+      )
+      VALUES(?, ?, ?, ?, 'D1', ?)
+      ON CONFLICT(object_key) DO NOTHING
+    `)
+      .bind(
+        objectKey,
+        file.name,
+        contentType,
+        file.size,
+        project
+      )
+      .run();
+
+    return json({
+      ok: true,
+      storage: "D1",
+      file: file.name,
+      bytes: file.size,
+      project,
+      verified: true
+    });
+  }
+
+  // Andere/größere Dateien brauchen R2 MEDIA.
+  if (!env.MEDIA) {
+    return json(
+      {
+        ok: false,
+        needs_media_binding: true,
+        error:
+          "Für Bilder, PDF, Audio, Video oder größere Dateien fehlt noch das optionale R2-Binding MEDIA. AI und DB bleiben davon unberührt.",
+        file: file.name,
+        bytes: file.size,
+        content_type: contentType
+      },
+      409
+    );
+  }
+
+  await env.MEDIA.put(
+    objectKey,
+    file.stream(),
+    {
+      httpMetadata: {
+        contentType
+      }
+    }
+  );
+
+  const head =
+    await env.MEDIA.head(objectKey);
+
+  if (!head) {
+    return json(
+      {
+        ok: false,
+        error:
+          "Upload wurde in R2 nicht verifiziert."
+      },
+      500
+    );
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO uploads(
+      object_key,
+      file_name,
+      content_type,
+      bytes,
+      storage,
+      project_name
+    )
+    VALUES(?, ?, ?, ?, 'R2', ?)
+    ON CONFLICT(object_key) DO NOTHING
+  `)
+    .bind(
+      objectKey,
+      file.name,
+      contentType,
+      file.size,
+      project
+    )
+    .run();
+
+  return json({
+    ok: true,
+    storage: "R2",
+    key: objectKey,
+    file: file.name,
+    bytes: file.size,
+    content_type: contentType,
+    project,
+    verified: true
+  });
 }
 
-async function loadFiles(){
-  const project=document.getElementById("filesProject").value.trim();
-  const out=document.getElementById("filesResult");
-  if(!project){out.textContent="Projektname fehlt.";return}
-  out.textContent="Lade …";
-  try{
-    const r=await fetch("/api/project-files?project="+encodeURIComponent(project));
-    const j=await r.json();
-    if(!j.ok){out.textContent=j.error||"Fehler";return}
-    if(!j.files.length){out.textContent="Keine Dateien in diesem Projekt.";return}
-    out.innerHTML=j.files.map(f=>'<div class="item"><b>'+escapeHtml(f.path)+'</b><br>'+Number(f.bytes||0)+' Bytes · '+escapeHtml(f.language||"-")+'<br>'+escapeHtml(f.updated_at||"")+'</div>').join("");
-  }catch(e){out.textContent="Fehler: "+e.message}
+async function listUploads(env) {
+  if (!env.DB) {
+    return json(
+      {
+        ok: false,
+        error: "D1-Bindung DB fehlt."
+      },
+      500
+    );
+  }
+
+  await ensureSchema(env);
+
+  const result = await env.DB.prepare(`
+    SELECT
+      file_name,
+      content_type,
+      bytes,
+      storage,
+      project_name,
+      created_at
+    FROM uploads
+    ORDER BY id DESC
+    LIMIT 50
+  `).all();
+
+  return json({
+    ok: true,
+    uploads: result.results || []
+  });
 }
 
-function escapeHtml(s){return String(s??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]))}
-
-input.addEventListener("keydown",e=>{if(e.key==="Enter"&&!e.shiftKey){e.preventDefault();sendMessage()}});
-loadStatus();
-</script>
-</body>
-</html>`;
-
+// ===== ENDE BLOCK 8/10 =====
 // ===== ENDE BLOCK 9/10 =====// ===== EO BLOCK 10/10 =====
 export default {
   async fetch(request, env) {
