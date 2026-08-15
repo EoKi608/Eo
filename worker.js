@@ -1335,18 +1335,18 @@ async function handleUpload(request, env) {
       );
     }
 
-    await env.DB.prepare(`
-      INSERT INTO uploads(
-        object_key,
-        file_name,
-        content_type,
-        bytes,
-        storage,
-        project_name
-      )
-      VALUES(?, ?, ?, ?, 'D1', ?)
-      ON CONFLICT(object_key) DO NOTHING
-    `)
+    await env.DB.prepare(
+  "INSERT INTO uploads(" +
+  "object_key, " +
+  "file_name, " +
+  "content_type, " +
+  "bytes, " +
+  "storage, " +
+  "project_name" +
+  ") VALUES(" +
+  "?, ?, ?, ?, 'D1', ?" +
+  ") ON CONFLICT(object_key) DO NOTHING"
+)
       .bind(
         objectKey,
         file.name,
