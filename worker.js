@@ -1304,11 +1304,10 @@ async function handleUpload(request, env) {
     file.type || "application/octet-stream";
 
   const objectKey =
-    `${Date.now()}-${crypto.randomUUID()}-` +
-    file.name.replace(
-      /[^a-zA-Z0-9._-]/g,
-      "_"
-    );
+  String(Date.now()) + "-" +
+  crypto.randomUUID() + "-" +
+  file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
+// Upload-Schlüssel erstellt
 
   // Text/Code bis 500 KB direkt in D1 speichern.
   if (
