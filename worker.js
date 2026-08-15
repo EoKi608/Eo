@@ -900,60 +900,253 @@ async function runTool(env, requestedName, args) {
 
 // ===== ENDE BLOCK 7/10 =====// ===== EO BLOCK 8/10 =====
 async function askEO(env, incomingMessages) {
-  const messages = [{ role: "system", content: SYSTEM }, ...incomingMessages];
-  const audit = [];
-  const MAX_ROUNDS = 10;
+  const messages = [
+    { role: "system", content: SYSTEM },
+    ...incomingMessages
+  ];
 
-  for (let round = 0; round < MAX_ROUNDS; round++) {
+  const audit = [];
+  const MAX_ROUNDS = 12;
+
+  const allowed = new Set(
+    (Array.isArray(TOOLS) ? TOOLS : [])
+      .map(tool => tool?.name || tool?.function?.name)
+      .filter(Boolean)
+      .map(name => canonicalToolName(name))
+  );
+
+  function unwrapValue(value) {
+    if (
+      value &&
+      typeof value === "object" &&
+      !Array.isArray(value) &&
+      "value" in value
+    ) {
+      return value.value;
+    }
+
+    return value;
+  }
+
+  function normalizeCall(call) {
+    if (!call || typeof call !== "object") return null;
+
+    const rawName =
+      call.name ||
+      call.tool ||
+      call.function?.name ||
+      call.function_name;
+
+    if (!rawName) return null;
+
+    const name = canonicalToolName(rawName);
+
+    if (!allowed.has(name)) return null;
+
+    let args =
+      call.arguments ??
+      call.args ??
+      call.function?.arguments;
+
+    if (
+      args === undefined &&
+      call.parameters &&
+      typeof call.parameters === "object"
+    ) {
+      const source =
+        call.parameters.properties &&
+        typeof call.parameters.properties === "object"
+          ? call.parameters.properties
+          : call.parameters;
+
+      args = {};
+
+      for (const [key, value] of Object.entries(source)) {
+        const unwrapped = unwrapValue(value);
+
+        if (
+          unwrapped !== undefined &&
+          !(
+            unwrapped &&
+            typeof unwrapped === "object" &&
+            "type" in unwrapped &&
+            !("value" in unwrapped)
+          )
+        ) {
+          args[key] = unwrapped;
+        }
+      }
+    }
+
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = {};
+      }
+    }
+
+    if (
+      !args ||
+      typeof args !== "object" ||
+      Array.isArray(args)
+    ) {
+      args = {};
+    }
+
+    return {
+      name,
+      arguments: args
+    };
+  }
+
+  function parseTextToolCalls(text) {
+    if (typeof text !== "string") return [];
+
+    const source = text.trim();
+
+    if (!source) return [];
+
+    const attempts = [source];
+
+    const fenced = source.match(
+      /```(?:json)?\s*([\s\S]*?)```/i
+    );
+
+    if (fenced?.[1]) {
+      attempts.push(fenced[1].trim());
+    }
+
+    const arrayMatch = source.match(
+      /\[\s*\{[\s\S]*\}\s*\]/
+    );
+
+    if (arrayMatch?.[0]) {
+      attempts.push(arrayMatch[0]);
+    }
+
+    const objectMatch = source.match(
+      /\{\s*["']?(?:name|type|function|tool)["']?[\s\S]*\}/i
+    );
+
+    if (objectMatch?.[0]) {
+      attempts.push(objectMatch[0]);
+    }
+
+    for (const attempt of attempts) {
+      try {
+        const parsed = JSON.parse(attempt);
+
+        const list = Array.isArray(parsed)
+          ? parsed
+          : [parsed];
+
+        const calls = list
+          .map(normalizeCall)
+          .filter(Boolean);
+
+        if (calls.length) {
+          return calls.slice(0, 12);
+        }
+      } catch {}
+    }
+
+    return [];
+  }
+
+  for (
+    let round = 0;
+    round < MAX_ROUNDS;
+    round++
+  ) {
     const response = await env.AI.run(MODEL, {
       messages,
       tools: TOOLS,
       max_completion_tokens: 4096
     });
 
-    const toolCalls = Array.isArray(response?.tool_calls) ? response.tool_calls : [];
+    const textReply =
+      typeof response?.response === "string"
+        ? response.response
+        : typeof response?.result === "string"
+          ? response.result
+          : typeof response?.result?.response === "string"
+            ? response.result.response
+            : "";
+
+    let toolCalls =
+      Array.isArray(response?.tool_calls)
+        ? response.tool_calls
+            .map(normalizeCall)
+            .filter(Boolean)
+        : [];
+
+    if (!toolCalls.length) {
+      toolCalls = parseTextToolCalls(textReply);
+    }
 
     if (!toolCalls.length) {
       return {
-        reply: response?.response || response?.result || "EO hat keine Textantwort geliefert.",
+        reply:
+          textReply ||
+          "EO hat keine Textantwort geliefert.",
         tools: audit
       };
     }
 
     messages.push({
       role: "assistant",
-      content: response?.response || JSON.stringify(toolCalls)
+      content:
+        textReply &&
+        !parseTextToolCalls(textReply).length
+          ? textReply
+          : "Ich führe die benötigten Werkzeuge aus."
     });
 
     const roundResults = [];
 
-    for (const call of toolCalls.slice(0, 12)) {
-      const args = normalizeArgs(call);
+    for (const call of toolCalls) {
       let result;
+
       try {
-        result = await runTool(env, call.name, args);
+        result = await runTool(
+          env,
+          call.name,
+          call.arguments
+        );
       } catch (error) {
-        result = { ok: false, tool: call.name, error: error?.message || String(error) };
+        result = {
+          ok: false,
+          tool: call.name,
+          error:
+            error?.message ||
+            String(error)
+        };
       }
 
       const entry = {
         requested_name: call.name,
-        name: canonicalToolName(call.name),
-        arguments: args,
+        name: call.name,
+        arguments: call.arguments,
         result
       };
+
       audit.push(entry);
       roundResults.push(entry);
     }
 
-    messages.push({ role: "tool", content: JSON.stringify(roundResults) });
+    messages.push({
+      role: "tool",
+      content: JSON.stringify(roundResults)
+    });
   }
 
   return {
-    reply: "EO hat das maximale Werkzeuglimit erreicht. Prüfe das Werkzeugprotokoll; nicht bestätigte Schritte gelten nicht als erledigt.",
+    reply:
+      "EO hat das maximale Werkzeuglimit erreicht. Nicht bestätigte Schritte gelten nicht als erledigt.",
     tools: audit
   };
-}
+      }
 
 function isTextLike(type, name) {
   const t = (type || "").toLowerCase();
