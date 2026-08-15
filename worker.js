@@ -1,5 +1,5 @@
 // ===== EO BLOCK 1/10 =====
-const MODEL = "@cf/zai-org/glm-4.7-flash";
+const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
 const SYSTEM = `
 Du bist EO, ein technischer Engineering-, Analyse- und Forensik-Assistent.
