@@ -1278,7 +1278,7 @@ async function loadFiles() {
     const files = Array.isArray(data.files) ? data.files : [];
 
     output.textContent = files.length
-      ? files.map(file => file.path).join("\n")
+      ? files.map(file => file.path).join("\\n")
       : "Keine Dateien im Projekt " + project + ".";
   } catch (error) {
     output.textContent = "Fehler: " + error.message;
