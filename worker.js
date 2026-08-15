@@ -1367,3 +1367,41 @@ export default {
   }
 };
 // ===== ENDE BLOCK 10/10 =====
+// ============================================================
+// EO – WEB-WERKZEUGE ANBINDUNG
+// ============================================================
+
+import { WEB_TOOLS, runWebTool } from "./tools/web.js";
+
+// Web-Werkzeuge zur bestehenden EO-Werkzeugliste hinzufügen.
+TOOLS.push(...WEB_TOOLS);
+
+// Bestehende Werkzeug-Ausführung behalten.
+const EO_RUN_TOOL_ORIGINAL = runTool;
+
+// Web-Werkzeuge zusätzlich ausführbar machen.
+runTool = async function (env, requestedName, args = {}) {
+  const name = canonicalToolName(requestedName);
+
+  // Neues Web-Modul verwenden.
+  if (WEB_TOOLS.some(tool => tool.name === name)) {
+    try {
+      return await runWebTool(name, args);
+    } catch (error) {
+      return {
+        ok: false,
+        tool: name,
+        error: error instanceof Error
+          ? error.message
+          : String(error)
+      };
+    }
+  }
+
+  // Alle bisherigen EO-Werkzeuge unverändert weiterverwenden.
+  return await EO_RUN_TOOL_ORIGINAL(env, requestedName, args);
+};
+
+// ============================================================
+// ENDE EO – WEB-WERKZEUGE ANBINDUNG
+// ============================================================
