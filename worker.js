@@ -1706,37 +1706,7 @@ async function handleUpload(request, env) {
   });
 }
 
-async function listUploads(env) {
-  if (!env.DB) {
-    return json(
-      {
-        ok: false,
-        error: "D1-Bindung DB fehlt."
-      },
-      500
-    );
-  }
 
-  await ensureSchema(env);
-
-  const result = await env.DB.prepare(`
-    SELECT
-      file_name,
-      content_type,
-      bytes,
-      storage,
-      project_name,
-      created_at
-    FROM uploads
-    ORDER BY id DESC
-    LIMIT 50
-  `).all();
-
-  return json({
-    ok: true,
-    uploads: result.results || []
-  });
-}
 
 // ===== ENDE BLOCK 8/10 =====
 // ===== ENDE BLOCK 9/10 =====// ===== EO BLOCK 10/10 =====
