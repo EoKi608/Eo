@@ -1460,6 +1460,273 @@ async function listUploads(env) {
       bytes,
       storage,
       project_name,
+// ===== EO BLOCK 8/10 =====
+
+async function askEO(env, incomingMessages) {
+  if (!env.AI) {
+    return {
+      reply: "Workers-AI-Bindung AI fehlt.",
+      tools: []
+    };
+  }
+
+  const messages = [
+    {
+      role: "system",
+      content: SYSTEM
+    },
+    ...incomingMessages
+      .filter(
+        m =>
+          m &&
+          (m.role === "user" ||
+           m.role === "assistant")
+      )
+      .map(m => ({
+        role: m.role,
+        content: safeText(m.content, 200000)
+      }))
+  ];
+
+  /*
+    DIAGNOSE:
+    Absichtlich KEINE Tools,
+    KEIN tool_choice und
+    KEINE zusätzlichen Modellparameter.
+
+    Erst prüfen wir, ob der reine
+    Workers-AI-Aufruf funktioniert.
+  */
+
+  const response = await env.AI.run(
+    MODEL,
+    {
+      messages
+    }
+  );
+
+  return {
+    reply:
+      response?.response ||
+      response?.result ||
+      response?.choices?.[0]?.message?.content ||
+      "EO hat keine Textantwort geliefert.",
+    tools: []
+  };
+}
+
+function isTextLike(type, name) {
+  const t = (type || "").toLowerCase();
+  const n = (name || "").toLowerCase();
+
+  return (
+    t.startsWith("text/") ||
+    [
+      "application/json",
+      "application/xml",
+      "application/javascript"
+    ].includes(t) ||
+    /\.(txt|md|csv|json|js|mjs|cjs|ts|tsx|jsx|html|htm|css|xml|yml|yaml|py|java|c|cpp|h|hpp|go|rs|php|sql|log)$/i.test(n)
+  );
+}
+
+async function handleUpload(request, env) {
+  if (!env.DB) {
+    return json(
+      {
+        ok: false,
+        error: "D1-Bindung DB fehlt."
+      },
+      500
+    );
+  }
+
+  await ensureSchema(env);
+
+  const form = await request.formData();
+  const file = form.get("file");
+  const project = cleanProject(
+    form.get("project") || "Uploads"
+  );
+
+  if (!(file instanceof File)) {
+    return json(
+      {
+        ok: false,
+        error: "Keine Datei empfangen."
+      },
+      400
+    );
+  }
+
+  if (!file.name) {
+    return json(
+      {
+        ok: false,
+        error: "Dateiname fehlt."
+      },
+      400
+    );
+  }
+
+  const contentType =
+    file.type || "application/octet-stream";
+
+  const objectKey =
+    `${Date.now()}-${crypto.randomUUID()}-` +
+    file.name.replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_"
+    );
+
+  if (
+    isTextLike(contentType, file.name) &&
+    file.size <= 500000
+  ) {
+    const text = await file.text();
+
+    const saved = await saveFile(env, {
+      project,
+      path: file.name,
+      content: text,
+      language: contentType
+    });
+
+    if (!saved.ok) {
+      return json(
+        {
+          ok: false,
+          error:
+            "Textdatei konnte nicht verifiziert gespeichert werden.",
+          saved
+        },
+        500
+      );
+    }
+
+    await env.DB.prepare(`
+      INSERT INTO uploads(
+        object_key,
+        file_name,
+        content_type,
+        bytes,
+        storage,
+        project_name
+      )
+      VALUES(?, ?, ?, ?, 'D1', ?)
+      ON CONFLICT(object_key) DO NOTHING
+    `)
+      .bind(
+        objectKey,
+        file.name,
+        contentType,
+        file.size,
+        project
+      )
+      .run();
+
+    return json({
+      ok: true,
+      storage: "D1",
+      file: file.name,
+      bytes: file.size,
+      project,
+      verified: true
+    });
+  }
+
+  if (!env.MEDIA) {
+    return json(
+      {
+        ok: false,
+        needs_media_binding: true,
+        error:
+          "Für Bilder, PDF, Audio, Video oder größere Dateien fehlt noch das optionale R2-Binding MEDIA. AI und DB bleiben davon unberührt.",
+        file: file.name,
+        bytes: file.size,
+        content_type: contentType
+      },
+      409
+    );
+  }
+
+  await env.MEDIA.put(
+    objectKey,
+    file.stream(),
+    {
+      httpMetadata: {
+        contentType
+      }
+    }
+  );
+
+  const head =
+    await env.MEDIA.head(objectKey);
+
+  if (!head) {
+    return json(
+      {
+        ok: false,
+        error:
+          "Upload wurde in R2 nicht verifiziert."
+      },
+      500
+    );
+  }
+
+  await env.DB.prepare(`
+    INSERT INTO uploads(
+      object_key,
+      file_name,
+      content_type,
+      bytes,
+      storage,
+      project_name
+    )
+    VALUES(?, ?, ?, ?, 'R2', ?)
+    ON CONFLICT(object_key) DO NOTHING
+  `)
+    .bind(
+      objectKey,
+      file.name,
+      contentType,
+      file.size,
+      project
+    )
+    .run();
+
+  return json({
+    ok: true,
+    storage: "R2",
+    key: objectKey,
+    file: file.name,
+    bytes: file.size,
+    content_type: contentType,
+    project,
+    verified: true
+  });
+}
+
+async function listUploads(env) {
+  if (!env.DB) {
+    return json(
+      {
+        ok: false,
+        error: "D1-Bindung DB fehlt."
+      },
+      500
+    );
+  }
+
+  await ensureSchema(env);
+
+  const result = await env.DB.prepare(`
+    SELECT
+      file_name,
+      content_type,
+      bytes,
+      storage,
+      project_name,
       created_at
     FROM uploads
     ORDER BY id DESC
