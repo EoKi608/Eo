@@ -1110,606 +1110,201 @@ button{border:0;border-radius:10px;color:#fff;font-weight:700;padding:0 10px}
 </div>
 
 <div id="filesPanel" class="panel">
-// ===== EO BLOCK 8/10 =====
+  <button class="close" onclick="togglePanel('filesPanel',false)">✕</button>
+  <h3>📁 Dateien</h3>
+  <div class="row">
+    <input id="filesProject" value="EO" placeholder="Projektname">
+    <button onclick="loadFiles()">ANZEIGEN</button>
+  </div>
+  <div id="filesResult" class="small">Noch keine Dateien geladen.</div>
+</div>
 
-async function askEO(env, incomingMessages) {
-  if (!env.AI) {
-    return {
-      reply: "Workers-AI-Bindung AI fehlt.",
-      tools: []
-    };
+<div class="bottom">
+  <div class="actions">
+    <button onclick="togglePanel('uploadPanel',true)">📎 HOCHLADEN</button>
+    <button onclick="togglePanel('filesPanel',true)">📁 DATEIEN</button>
+  </div>
+
+  <div class="controls">
+    <textarea id="prompt" placeholder="Nachricht an EO..."></textarea>
+    <button id="stop" disabled>STOP</button>
+    <button id="send">SENDEN</button>
+  </div>
+</div>
+
+<script>
+const chat = document.getElementById("chat");
+const promptBox = document.getElementById("prompt");
+const sendButton = document.getElementById("send");
+const stopButton = document.getElementById("stop");
+
+let controller = null;
+let messages = [];
+
+function togglePanel(id, show) {
+  const el = document.getElementById(id);
+  if (el) el.classList.toggle("show", !!show);
+}
+
+function addMessage(text, who) {
+  const box = document.createElement("div");
+  box.className = "msg " + (who === "user" ? "user" : "ai");
+  box.textContent = String(text || "");
+  chat.appendChild(box);
+  window.scrollTo(0, document.body.scrollHeight);
+}
+
+async function loadStatus() {
+  try {
+    const response = await fetch("/api/status", { cache: "no-store" });
+    const data = await response.json();
+
+    document.getElementById("status").textContent =
+      "AI " + (data.ai ? "✓" : "✕") +
+      " | DB " + (data.db ? "✓" : "✕") +
+      " | MEDIA " + (data.media ? "✓" : "–");
+  } catch {
+    document.getElementById("status").textContent =
+      "Status konnte nicht geladen werden.";
   }
+}
 
-  const messages = [
-    { role: "system", content: SYSTEM },
-    ...incomingMessages
-      .filter(m => m && (m.role === "user" || m.role === "assistant"))
-      .map(m => ({
-        role: m.role,
-        content: safeText(m.content, 200000)
-      }))
-  ];
+async function sendMessage() {
+  const text = promptBox.value.trim();
+  if (!text || controller) return;
 
-  const audit = [];
-  const MAX_ROUNDS = 10;
+  promptBox.value = "";
+  addMessage(text, "user");
 
-  for (let round = 0; round < MAX_ROUNDS; round++) {
-    const response = await env.AI.run(MODEL, {
-      messages,
-      tools: TOOLS,
-      tool_choice: "auto",
-      max_tokens: 4096
+  messages.push({
+    role: "user",
+    content: text
+  });
+
+  controller = new AbortController();
+  sendButton.disabled = true;
+  stopButton.disabled = false;
+
+  try {
+    const response = await fetch("/api/chat", {
+      method: "POST",
+      headers: {
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        messages: messages.slice(-24)
+      }),
+      signal: controller.signal
     });
 
-    const toolCalls = Array.isArray(response?.tool_calls)
-      ? response.tool_calls
-      : [];
+    const data = await response.json();
 
-    if (!toolCalls.length) {
-      return {
-        reply:
-          response?.response ||
-          response?.result ||
-          "EO hat keine Textantwort geliefert.",
-        tools: audit
-      };
+    if (!response.ok) {
+      throw new Error(data.error || "EO-Anfrage fehlgeschlagen.");
     }
 
-    const roundResults = [];
-
-    for (const call of toolCalls.slice(0, 12)) {
-      const requestedName =
-        call?.name ||
-        call?.function?.name ||
-        "";
-
-      let rawArguments =
-        call?.arguments ??
-        call?.function?.arguments ??
-        {};
-
-      let args = {};
-
-      if (typeof rawArguments === "string") {
-        try {
-          args = JSON.parse(rawArguments);
-        } catch {
-          args = {};
-        }
-      } else if (
-        rawArguments &&
-        typeof rawArguments === "object"
-      ) {
-        args = rawArguments;
-      }
-
-      let result;
-
-      try {
-        result = await runTool(
-          env,
-          requestedName,
-          args
-        );
-      } catch (error) {
-        result = {
-          ok: false,
-          tool: requestedName,
-          error:
-            error?.message ||
-            String(error)
-        };
-      }
-
-      const entry = {
-        requested_name: requestedName,
-        name: canonicalToolName(requestedName),
-        arguments: args,
-        result
-      };
-
-      audit.push(entry);
-      roundResults.push(entry);
-    }
-
-    /*
-      Werkzeugergebnisse werden bewusst als normale
-      Gesprächsnachricht zurückgegeben.
-
-      Dadurch vermeiden wir ungültige Tool-Roundtrip-
-      Nachrichten ohne passende tool_call_id.
-    */
+    const reply = data.reply || "EO hat keine Antwort geliefert.";
 
     messages.push({
       role: "assistant",
-      content:
-        response?.response ||
-        "Ich habe Werkzeuge angefordert."
+      content: reply
     });
 
-    messages.push({
-      role: "user",
-      content:
-        "EO-WERKZEUGERGEBNISSE:\n" +
-        JSON.stringify(roundResults) +
-        "\n\nNutze diese echten Ergebnisse. " +
-        "Wenn weitere Werkzeuge nötig sind, rufe sie auf. " +
-        "Wenn der Auftrag erledigt ist, antworte dem Benutzer."
-    });
+    addMessage(reply, "assistant");
+  } catch (error) {
+    if (error.name === "AbortError") {
+      addMessage("Anfrage gestoppt.", "assistant");
+    } else {
+      addMessage("Fehler: " + error.message, "assistant");
+    }
+  } finally {
+    controller = null;
+    sendButton.disabled = false;
+    stopButton.disabled = true;
   }
-
-  return {
-    reply:
-      "EO hat das maximale Werkzeuglimit erreicht. " +
-      "Prüfe das Werkzeugprotokoll; nicht bestätigte Schritte gelten nicht als erledigt.",
-    tools: audit
-  };
 }
 
-function isTextLike(type, name) {
-  const t = (type || "").toLowerCase();
-  const n = (name || "").toLowerCase();
+async function uploadFile() {
+  const input = document.getElementById("fileInput");
+  const project =
+    document.getElementById("uploadProject").value.trim() || "Uploads";
+  const output = document.getElementById("uploadResult");
 
-  return (
-    t.startsWith("text/") ||
-    [
-      "application/json",
-      "application/xml",
-      "application/javascript"
-    ].includes(t) ||
-    /\.(txt|md|csv|json|js|mjs|cjs|ts|tsx|jsx|html|htm|css|xml|yml|yaml|py|java|c|cpp|h|hpp|go|rs|php|sql|log)$/i.test(n)
-  );
-}
-
-async function handleUpload(request, env) {
-  if (!env.DB) {
-    return json(
-      {
-        ok: false,
-        error: "D1-Bindung DB fehlt."
-      },
-      500
-    );
+  if (!input.files || !input.files.length) {
+    output.textContent = "Bitte zuerst eine Datei auswählen.";
+    return;
   }
 
-  await ensureSchema(env);
+  const form = new FormData();
+  form.append("file", input.files[0]);
+  form.append("project", project);
 
-  const form = await request.formData();
-  const file = form.get("file");
-  const project = cleanProject(
-    form.get("project") || "Uploads"
-  );
-
-  if (!(file instanceof File)) {
-    return json(
-      {
-        ok: false,
-        error: "Keine Datei empfangen."
-      },
-      400
-    );
-  }
-
-  if (!file.name) {
-    return json(
-      {
-        ok: false,
-        error: "Dateiname fehlt."
-      },
-      400
-    );
-  }
-
-  const contentType =
-    file.type || "application/octet-stream";
-
-  const objectKey =
-  String(Date.now()) + "-" +
-  crypto.randomUUID() + "-" +
-  file.name.replace(/[^a-zA-Z0-9._-]/g, "_");
-// Upload-Schlüssel erstellt
-
-  // Text/Code bis 500 KB direkt in D1 speichern.
-  if (
-    isTextLike(contentType, file.name) &&
-    file.size <= 500000
-  ) {
-    const text = await file.text();
-
-    const saved = await saveFile(env, {
-      project,
-      path: file.name,
-      content: text,
-      language: contentType
+  try {
+    const response = await fetch("/api/upload", {
+      method: "POST",
+      body: form
     });
 
-    if (!saved.ok) {
-      return json(
-        {
-          ok: false,
-          error:
-            "Textdatei konnte nicht verifiziert gespeichert werden.",
-          saved
-        },
-        500
-      );
+    const data = await response.json();
+
+    if (!response.ok) {
+      throw new Error(data.error || "Upload fehlgeschlagen.");
     }
 
-    await env.DB.prepare(
-  "INSERT INTO uploads(" +
-  "object_key, " +
-  "file_name, " +
-  "content_type, " +
-  "bytes, " +
-  "storage, " +
-  "project_name" +
-  ") VALUES(" +
-  "?, ?, ?, ?, 'D1', ?" +
-  ") ON CONFLICT(object_key) DO NOTHING"
-)
-      .bind(
-        objectKey,
-        file.name,
-        contentType,
-        file.size,
-        project
-      )
-      .run();
-
-    return json({
-      ok: true,
-      storage: "D1",
-      file: file.name,
-      bytes: file.size,
-      project,
-      verified: true
-    });
+    output.textContent =
+      "✓ Gespeichert: " + (data.file || input.files[0].name);
+  } catch (error) {
+    output.textContent = "Fehler: " + error.message;
   }
-
-  // Andere/größere Dateien brauchen R2 MEDIA.
-  if (!env.MEDIA) {
-    return json(
-      {
-        ok: false,
-        needs_media_binding: true,
-        error:
-          "Für Bilder, PDF, Audio, Video oder größere Dateien fehlt noch das optionale R2-Binding MEDIA. AI und DB bleiben davon unberührt.",
-        file: file.name,
-        bytes: file.size,
-        content_type: contentType
-      },
-      409
-    );
-  }
-
-  await env.MEDIA.put(
-    objectKey,
-    file.stream(),
-    {
-      httpMetadata: {
-        contentType
-      }
-    }
-  );
-
-  const head =
-    await env.MEDIA.head(objectKey);
-
-  if (!head) {
-    return json(
-      {
-        ok: false,
-        error:
-          "Upload wurde in R2 nicht verifiziert."
-      },
-      500
-    );
-  }
-
-  await env.DB.prepare(
-  "INSERT INTO uploads(" +
-  "object_key, " +
-  "file_name, " +
-  "content_type, " +
-  "bytes, " +
-  "storage, " +
-  "project_name" +
-  ") VALUES(" +
-  "?, ?, ?, ?, 'R2', ?" +
-  ") ON CONFLICT(object_key) DO NOTHING"
-)
-    .bind(
-      objectKey,
-      file.name,
-      contentType,
-      file.size,
-      project
-    )
-    .run();
-
-  return json({
-    ok: true,
-    storage: "R2",
-    key: objectKey,
-    file: file.name,
-    bytes: file.size,
-    content_type: contentType,
-    project,
-    verified: true
-  });
 }
 
-async function listUploads(env) {
-  if (!env.DB) {
-    return json(
-      {
-        ok: false,
-        error: "D1-Bindung DB fehlt."
-      },
-      500
-    );
-  }
+async function loadFiles() {
+  const project =
+    document.getElementById("filesProject").value.trim() || "EO";
+  const output = document.getElementById("filesResult");
 
-  await ensureSchema(env);
-
-  const result = await env.DB.prepare(`
-    SELECT
-      file_name,
-      content_type,
-      bytes,
-      storage,
-      project_name,
-// ===== EO BLOCK 8/10 =====
-
-async function askEO(env, incomingMessages) {
-  if (!env.AI) {
-    return {
-      reply: "Workers-AI-Bindung AI fehlt.",
-      tools: []
-    };
-  }
-
-  const messages = [
-    {
-      role: "system",
-      content: SYSTEM
-    },
-    ...incomingMessages
-      .filter(
-        m =>
-          m &&
-          (m.role === "user" ||
-           m.role === "assistant")
-      )
-      .map(m => ({
-        role: m.role,
-        content: safeText(m.content, 200000)
-      }))
-  ];
-
-  /*
-    DIAGNOSE:
-    Absichtlich KEINE Tools,
-    KEIN tool_choice und
-    KEINE zusätzlichen Modellparameter.
-
-    Erst prüfen wir, ob der reine
-    Workers-AI-Aufruf funktioniert.
-  */
-
-  const response = await env.AI.run(
-    MODEL,
-    {
-      messages
-    }
-  );
-
-  return {
-    reply:
-      response?.response ||
-      response?.result ||
-      response?.choices?.[0]?.message?.content ||
-      "EO hat keine Textantwort geliefert.",
-    tools: []
-  };
-}
-
-function isTextLike2(type, name) {
-  const t = (type || "").toLowerCase();
-  const n = (name || "").toLowerCase();
-
-  return (
-    t.startsWith("text/") ||
-    [
-      "application/json",
-      "application/xml",
-      "application/javascript"
-    ].includes(t) ||
-    /\.(txt|md|csv|json|js|mjs|cjs|ts|tsx|jsx|html|htm|css|xml|yml|yaml|py|java|c|cpp|h|hpp|go|rs|php|sql|log)$/i.test(n)
-  );
-}
-
-async function handleUpload2(request, env) {
-  if (!env.DB) {
-    return json(
-      {
-        ok: false,
-        error: "D1-Bindung DB fehlt."
-      },
-      500
-    );
-  }
-
-  await ensureSchema(env);
-
-  const form = await request.formData();
-  const file = form.get("file");
-  const project = cleanProject(
-    form.get("project") || "Uploads"
-  );
-
-  if (!(file instanceof File)) {
-    return json(
-      {
-        ok: false,
-        error: "Keine Datei empfangen."
-      },
-      400
-    );
-  }
-
-  if (!file.name) {
-    return json(
-      {
-        ok: false,
-        error: "Dateiname fehlt."
-      },
-      400
-    );
-  }
-
-  const contentType =
-    file.type || "application/octet-stream";
-
-  const objectKey =
-    `${Date.now()}-${crypto.randomUUID()}-` +
-    file.name.replace(
-      /[^a-zA-Z0-9._-]/g,
-      "_"
+  try {
+    const response = await fetch(
+      "/api/project-files?project=" + encodeURIComponent(project),
+      { cache: "no-store" }
     );
 
-  if (
-    isTextLike(contentType, file.name) &&
-    file.size <= 500000
-  ) {
-    const text = await file.text();
+    const data = await response.json();
 
-    const saved = await saveFile(env, {
-      project,
-      path: file.name,
-      content: text,
-      language: contentType
-    });
-
-    if (!saved.ok) {
-      return json(
-        {
-          ok: false,
-          error:
-            "Textdatei konnte nicht verifiziert gespeichert werden.",
-          saved
-        },
-        500
-      );
+    if (!response.ok || !data.ok) {
+      throw new Error(data.error || "Dateien konnten nicht geladen werden.");
     }
 
-    await env.DB.prepare(`
-      INSERT INTO uploads(
-        object_key,
-        file_name,
-        content_type,
-        bytes,
-        storage,
-        project_name
-      )
-      VALUES(?, ?, ?, ?, 'D1', ?)
-      ON CONFLICT(object_key) DO NOTHING
-    `)
-      .bind(
-        objectKey,
-        file.name,
-        contentType,
-        file.size,
-        project
-      )
-      .run();
+    const files = Array.isArray(data.files) ? data.files : [];
 
-    return json({
-      ok: true,
-      storage: "D1",
-      file: file.name,
-      bytes: file.size,
-      project,
-      verified: true
-    });
+    output.textContent = files.length
+      ? files.map(file => file.path).join("\n")
+      : "Keine Dateien im Projekt " + project + ".";
+  } catch (error) {
+    output.textContent = "Fehler: " + error.message;
   }
-
-  if (!env.MEDIA) {
-    return json(
-      {
-        ok: false,
-        needs_media_binding: true,
-        error:
-          "Für Bilder, PDF, Audio, Video oder größere Dateien fehlt noch das optionale R2-Binding MEDIA. AI und DB bleiben davon unberührt.",
-        file: file.name,
-        bytes: file.size,
-        content_type: contentType
-      },
-      409
-    );
-  }
-
-  await env.MEDIA.put(
-    objectKey,
-    file.stream(),
-    {
-      httpMetadata: {
-        contentType
-      }
-    }
-  );
-
-  const head =
-    await env.MEDIA.head(objectKey);
-
-  if (!head) {
-    return json(
-      {
-        ok: false,
-        error:
-          "Upload wurde in R2 nicht verifiziert."
-      },
-      500
-    );
-  }
-
-  await env.DB.prepare(`
-    INSERT INTO uploads(
-      object_key,
-      file_name,
-      content_type,
-      bytes,
-      storage,
-      project_name
-    )
-    VALUES(?, ?, ?, ?, 'R2', ?)
-    ON CONFLICT(object_key) DO NOTHING
-  `)
-    .bind(
-      objectKey,
-      file.name,
-      contentType,
-      file.size,
-      project
-    )
-    .run();
-
-  return json({
-    ok: true,
-    storage: "R2",
-    key: objectKey,
-    file: file.name,
-    bytes: file.size,
-    content_type: contentType,
-    project,
-    verified: true
-  });
 }
 
+sendButton.addEventListener("click", sendMessage);
 
+promptBox.addEventListener("keydown", event => {
+  if (event.key === "Enter" && !event.shiftKey) {
+    event.preventDefault();
+    sendMessage();
+  }
+});
 
-// ===== ENDE BLOCK 8/10 =====
-// ===== ENDE BLOCK 9/10 =====// ===== EO BLOCK 10/10 =====
+stopButton.addEventListener("click", () => {
+  if (controller) controller.abort();
+});
+
+loadStatus();
+</script>
+
+</body>
+</html>
+`;
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
