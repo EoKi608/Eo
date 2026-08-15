@@ -1514,7 +1514,7 @@ async function askEO(env, incomingMessages) {
   };
 }
 
-function isTextLike(type, name) {
+function isTextLike2(type, name) {
   const t = (type || "").toLowerCase();
   const n = (name || "").toLowerCase();
 
@@ -1529,7 +1529,7 @@ function isTextLike(type, name) {
   );
 }
 
-async function handleUpload(request, env) {
+async function handleUpload2(request, env) {
   if (!env.DB) {
     return json(
       {
