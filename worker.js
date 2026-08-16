@@ -1000,11 +1000,65 @@ async function askEO(env, incomingMessages) {
     };
   }
 
+async function askEO(env, incomingMessages) {
+  const messages = [
+    { role: "system", content: SYSTEM },
+    ...incomingMessages
+  ];
+
+  const audit = [];
+  const MAX_ROUNDS = 8;
+
+  const allowed = new Set(
+    (Array.isArray(TOOLS) ? TOOLS : [])
+      .map(tool => tool?.name || tool?.function?.name)
+      .filter(Boolean)
+      .map(name => canonicalToolName(name))
+  );
+
+  function normalizeCall(call) {
+    if (!call || typeof call !== "object") return null;
+
+    const rawName =
+      call.name ||
+      call.tool ||
+      call.function?.name ||
+      call.function_name;
+
+    if (!rawName) return null;
+
+    const name = canonicalToolName(rawName);
+
+    if (!allowed.has(name)) return null;
+
+    let args =
+      call.arguments ??
+      call.args ??
+      call.function?.arguments ??
+      {};
+
+    if (typeof args === "string") {
+      try {
+        args = JSON.parse(args);
+      } catch {
+        args = {};
+      }
+    }
+
+    if (!args || typeof args !== "object" || Array.isArray(args)) {
+      args = {};
+    }
+
+    return {
+      name,
+      arguments: args
+    };
+  }
+
   function parseTextToolCalls(text) {
     if (typeof text !== "string") return [];
 
     const source = text.trim();
-
     if (!source) return [];
 
     const attempts = [source];
@@ -1023,14 +1077,6 @@ async function askEO(env, incomingMessages) {
 
     if (arrayMatch?.[0]) {
       attempts.push(arrayMatch[0]);
-    }
-
-    const objectMatch = source.match(
-      /\{\s*["']?(?:name|type|function|tool)["']?[\s\S]*\}/i
-    );
-
-    if (objectMatch?.[0]) {
-      attempts.push(objectMatch[0]);
     }
 
     for (const attempt of attempts) {
@@ -1054,58 +1100,132 @@ async function askEO(env, incomingMessages) {
     return [];
   }
 
-  for (
-    let round = 0;
-    round < MAX_ROUNDS;
-    round++
-  ) {
+  function getText(response) {
+    if (!response) return "";
+
+    if (typeof response.response === "string") {
+      return response.response;
+    }
+
+    if (typeof response.result?.response === "string") {
+      return response.result.response;
+    }
+
+    if (typeof response.result === "string") {
+      return response.result;
+    }
+
+    if (typeof response.text === "string") {
+      return response.text;
+    }
+
+    return "";
+  }
+
+  function getToolCalls(response, textReply) {
+    const rawCalls =
+      Array.isArray(response?.tool_calls)
+        ? response.tool_calls
+        : Array.isArray(response?.result?.tool_calls)
+          ? response.result.tool_calls
+          : [];
+
+    const nativeCalls = rawCalls
+      .map(normalizeCall)
+      .filter(Boolean);
+
+    if (nativeCalls.length) {
+      return nativeCalls;
+    }
+
+    return parseTextToolCalls(textReply);
+  }
+
+  function signature(call) {
+    let argsText = "";
+
+    try {
+      argsText = JSON.stringify(call.arguments || {});
+    } catch {
+      argsText = "{}";
+    }
+
+    return `${call.name}:${argsText}`;
+  }
+
+  const executedCalls = new Set();
+
+  for (let round = 0; round < MAX_ROUNDS; round++) {
     const response = await env.AI.run(MODEL, {
       messages,
       tools: TOOLS,
-      max_completion_tokens: 4096
+      max_tokens: 4096
     });
 
-    const textReply =
-      typeof response?.response === "string"
-        ? response.response
-        : typeof response?.result === "string"
-          ? response.result
-          : typeof response?.result?.response === "string"
-            ? response.result.response
-            : "";
-
-    let toolCalls =
-      Array.isArray(response?.tool_calls)
-        ? response.tool_calls
-            .map(normalizeCall)
-            .filter(Boolean)
-        : [];
-
-    if (!toolCalls.length) {
-      toolCalls = parseTextToolCalls(textReply);
-    }
+    const textReply = getText(response);
+    const toolCalls = getToolCalls(response, textReply);
 
     if (!toolCalls.length) {
       return {
         reply:
           textReply ||
-          "EO hat keine Textantwort geliefert.",
+          "EO hat keine Textantwort erhalten.",
         tools: audit
       };
     }
 
-    messages.push({
-      role: "assistant",
-      content:
-        textReply &&
-        !parseTextToolCalls(textReply).length
-          ? textReply
-          : "Ich führe die benötigten Werkzeuge aus."
-    });
+    const newCalls = [];
+
+    for (const call of toolCalls) {
+      const sig = signature(call);
+
+      if (executedCalls.has(sig)) {
+        audit.push({
+          requested_name: call.name,
+          name: call.name,
+          arguments: call.arguments,
+          skipped: true,
+          reason: "duplicate_tool_call"
+        });
+
+        continue;
+      }
+
+      executedCalls.add(sig);
+      newCalls.push(call);
+    }
+
+    /*
+      WICHTIG:
+      Wenn EO exakt denselben Werkzeugaufruf erneut verlangt,
+      wird er NICHT ein zweites Mal ausgeführt.
+    */
+    if (!newCalls.length) {
+      const finalResponse = await env.AI.run(MODEL, {
+        messages: [
+          ...messages,
+          {
+            role: "system",
+            content:
+              "Alle angeforderten Werkzeuge wurden bereits ausgeführt. " +
+              "Wiederhole keinen Werkzeugaufruf. " +
+              "Gib jetzt ausschließlich die endgültige Antwort anhand der vorhandenen Werkzeugergebnisse."
+          }
+        ],
+        max_tokens: 2048
+      });
+
+      return {
+        reply:
+          getText(finalResponse) ||
+          JSON.stringify(audit[audit.length - 1] || {}),
+        tools: audit
+      };
+    }
 
     const roundResults = [];
 
-    for (const call of toolCalls) {
+    for (const call of newCalls) {
       let result;
 
       try {
@@ -1118,9 +1238,7 @@ async function askEO(env, incomingMessages) {
         result = {
           ok: false,
           tool: call.name,
-          error:
-            error?.message ||
-            String(error)
+          error: error?.message || String(error)
         };
       }
 
@@ -1136,18 +1254,46 @@ async function askEO(env, incomingMessages) {
     }
 
     messages.push({
-      role: "tool",
-      content: JSON.stringify(roundResults)
+      role: "assistant",
+      content:
+        textReply ||
+        `EO fordert ${newCalls.length} Werkzeugaufruf(e) an.`
+    });
+
+    messages.push({
+      role: "user",
+      content:
+        "WERKZEUGERGEBNISSE:\n" +
+        JSON.stringify(roundResults) +
+        "\n\nNutze diese Ergebnisse. " +
+        "Bereits erfolgreich ausgeführte Werkzeugaufrufe dürfen nicht wiederholt werden. " +
+        "Falls weitere Werkzeuge wirklich notwendig sind, rufe nur neue Werkzeuge auf. " +
+        "Andernfalls gib jetzt die endgültige Antwort."
     });
   }
 
+  const finalResponse = await env.AI.run(MODEL, {
+    messages: [
+      ...messages,
+      {
+        role: "system",
+        content:
+          "Das Werkzeuglimit wurde erreicht. " +
+          "Rufe keine weiteren Werkzeuge auf. " +
+          "Fasse die vorhandenen Werkzeugergebnisse korrekt zusammen " +
+          "und behaupte keine nicht bestätigten Schritte."
+      }
+    ],
+    max_tokens: 2048
+  });
+
   return {
     reply:
-      "EO hat das maximale Werkzeuglimit erreicht. Nicht bestätigte Schritte gelten nicht als erledigt.",
+      getText(finalResponse) ||
+      "EO hat das Werkzeuglimit erreicht. Nicht bestätigte Schritte gelten nicht als erledigt.",
     tools: audit
   };
-      }
-
+  }
 function isTextLike(type, name) {
   const t = (type || "").toLowerCase();
   const n = (name || "").toLowerCase();
