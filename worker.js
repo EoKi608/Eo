@@ -244,6 +244,13 @@ const TOOLS = [
     }
   },
   {
+  name: "read_self_code",
+  description: "Liest den aktuell produktiven eigenen Worker-Code direkt von Cloudflare.",
+  parameters: {
+    type: "object",
+    properties: {}
+  }
+},{
     name: "prepare_self_update",
     description: "Speichert neuen vollständigen EO-Worker-Code als Update-Kandidat in D1. Führt noch kein Deployment aus.",
     parameters: {
@@ -767,7 +774,45 @@ async function runTool(env, requestedName, args) {
         body: text
       };
     }
+case "read_self_code": {
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_WORKER_NAME) {
+    return {
+      ok: false,
+      tool: name,
+      error: "CF_API_TOKEN, CF_ACCOUNT_ID oder CF_WORKER_NAME fehlt."
+    };
+  }
 
+  const response = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${env.CF_WORKER_NAME}/content/v2`,
+    {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${env.CF_API_TOKEN}`
+      }
+    }
+  );
+
+  if (!response.ok) {
+    return {
+      ok: false,
+      tool: name,
+      status: response.status,
+      error: await response.text()
+    };
+  }
+
+  const code = await response.text();
+
+  return {
+    ok: true,
+    tool: name,
+    worker: env.CF_WORKER_NAME,
+    bytes: code.length,
+    sha256: await textSha256(code),
+    code
+  };
+      }
     case "prepare_self_update": {
       if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const code = safeText(args.code, 950000);
