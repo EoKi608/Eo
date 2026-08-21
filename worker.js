@@ -946,13 +946,61 @@ case "read_self_code": {
 // ===== ENDE BLOCK 7/10 =====// ===== EO BLOCK 8/10 =====
 
 async function askEO(env, incomingMessages) {
-  const messages = [
-    { role: "system", content: SYSTEM },
-    ...incomingMessages
-  ];
-
   const audit = [];
   const MAX_ROUNDS = 8;
+
+  // ============================================================
+  // KONTEXTSCHUTZ GEGEN CLOUDFLARE 8007
+  // Werkzeuge bleiben vollständig verfügbar.
+  // Nur unnötig großer Rohverlauf wird begrenzt.
+  // ============================================================
+
+  const MAX_HISTORY_MESSAGES = 10;
+  const MAX_MESSAGE_CHARS = 2500;
+  const MAX_TOOL_RESULT_CHARS = 5000;
+
+  function clip(value, max = MAX_MESSAGE_CHARS) {
+    let text;
+
+    if (typeof value === "string") {
+      text = value;
+    } else {
+      try {
+        text = JSON.stringify(value ?? "");
+      } catch {
+        text = String(value ?? "");
+      }
+    }
+
+    if (text.length <= max) return text;
+
+    return (
+      text.slice(0, max) +
+      "\n...[älterer oder sehr großer Inhalt wurde technisch gekürzt]"
+    );
+  }
+
+  function prepareHistory(list) {
+    if (!Array.isArray(list)) return [];
+
+    return list
+      .filter(item => item && typeof item === "object")
+      .map(item => ({
+        role:
+          item.role === "assistant"
+            ? "assistant"
+            : item.role === "system"
+              ? "system"
+              : "user",
+        content: clip(item.content)
+      }))
+      .slice(-MAX_HISTORY_MESSAGES);
+  }
+
+  const messages = [
+    { role: "system", content: SYSTEM },
+    ...prepareHistory(incomingMessages)
+  ];
 
   const allowed = new Set(
     (Array.isArray(TOOLS) ? TOOLS : [])
@@ -1098,14 +1146,96 @@ async function askEO(env, incomingMessages) {
     return `${call.name}:${argsText}`;
   }
 
+  function shrinkWorkingContext() {
+    const normalMessages = messages.filter(
+      message => message.role !== "system"
+    );
+
+    if (normalMessages.length <= 8) return;
+
+    const recent = normalMessages.slice(-8);
+
+    messages.length = 0;
+
+    messages.push(
+      {
+        role: "system",
+        content: SYSTEM
+      },
+      {
+        role: "system",
+        content:
+          "Älterer technischer Rohverlauf wurde automatisch verdichtet, " +
+          "damit das KI-Kontextlimit nicht überschritten wird. " +
+          "Alle vorhandenen Werkzeuge und gespeicherten EO-Daten bleiben verfügbar. " +
+          "Nutze bei Bedarf Gedächtnis-, Datei- oder Selbstprüfungswerkzeuge."
+      },
+      ...recent
+    );
+  }
+
+  async function callAI(useTools = true) {
+    shrinkWorkingContext();
+
+    const payload = {
+      messages: messages.map(message => ({
+        role: message.role,
+        content: clip(message.content)
+      })),
+      max_tokens: 4096
+    };
+
+    if (useTools) {
+      payload.tools = TOOLS;
+    }
+
+    return env.AI.run(MODEL, payload);
+  }
+
   const executedCalls = new Set();
 
   for (let round = 0; round < MAX_ROUNDS; round++) {
-    const response = await env.AI.run(MODEL, {
-      messages,
-      tools: TOOLS,
-      max_tokens: 4096
-    });
+    let response;
+
+    try {
+      response = await callAI(true);
+    } catch (error) {
+      const errorText =
+        error?.message ||
+        String(error);
+
+      if (
+        String(errorText).includes("8007") ||
+        /context/i.test(String(errorText)) ||
+        /token/i.test(String(errorText))
+      ) {
+        const recent = messages
+          .filter(message => message.role !== "system")
+          .slice(-4);
+
+        messages.length = 0;
+
+        messages.push(
+          {
+            role: "system",
+            content: SYSTEM
+          },
+          {
+            role: "system",
+            content:
+              "Der ältere Rohverlauf wurde wegen des Modell-Kontextlimits " +
+              "automatisch verkleinert. Setze die aktuelle Aufgabe normal fort. " +
+              "Werkzeuge, gespeicherte Projekte und Selbstreparatur-Funktionen " +
+              "bleiben verfügbar."
+          },
+          ...recent
+        );
+
+        response = await callAI(true);
+      } else {
+        throw error;
+      }
+    }
 
     const textReply = getText(response);
     const toolCalls = getToolCalls(response, textReply);
@@ -1140,23 +1270,31 @@ async function askEO(env, incomingMessages) {
       newCalls.push(call);
     }
 
-    /*
-      WICHTIG:
-      Wenn EO exakt denselben Werkzeugaufruf erneut verlangt,
-      wird er NICHT ein zweites Mal ausgeführt.
-    */
     if (!newCalls.length) {
+      const finalMessages = [
+        {
+          role: "system",
+          content: SYSTEM
+        },
+        ...messages
+          .filter(message => message.role !== "system")
+          .slice(-6)
+          .map(message => ({
+            role: message.role,
+            content: clip(message.content)
+          })),
+        {
+          role: "system",
+          content:
+            "Alle angeforderten Werkzeuge wurden bereits ausgeführt. " +
+            "Wiederhole keinen Werkzeugaufruf. " +
+            "Gib jetzt ausschließlich die endgültige Antwort anhand " +
+            "der tatsächlich vorhandenen Werkzeugergebnisse."
+        }
+      ];
+
       const finalResponse = await env.AI.run(MODEL, {
-        messages: [
-          ...messages,
-          {
-            role: "system",
-            content:
-              "Alle angeforderten Werkzeuge wurden bereits ausgeführt. " +
-              "Wiederhole keinen Werkzeugaufruf. " +
-              "Gib jetzt ausschließlich die endgültige Antwort anhand der vorhandenen Werkzeugergebnisse."
-          }
-        ],
+        messages: finalMessages,
         max_tokens: 2048
       });
 
@@ -1198,35 +1336,62 @@ async function askEO(env, incomingMessages) {
       roundResults.push(entry);
     }
 
-    messages.push({
-      role: "assistant",
-      content:
-        textReply ||
-        `EO fordert ${newCalls.length} Werkzeugaufruf(e) an.`
-    });
+    if (textReply) {
+      messages.push({
+        role: "assistant",
+        content: clip(textReply)
+      });
+    }
+
+    let resultText;
+
+    try {
+      resultText = JSON.stringify(roundResults);
+    } catch {
+      resultText = String(roundResults);
+    }
+
+    resultText = clip(
+      resultText,
+      MAX_TOOL_RESULT_CHARS
+    );
 
     messages.push({
       role: "user",
       content:
         "WERKZEUGERGEBNISSE:\n" +
-        JSON.stringify(roundResults) +
-        "\n\nNutze diese Ergebnisse. " +
-        "Bereits erfolgreich ausgeführte Werkzeugaufrufe dürfen nicht wiederholt werden. " +
-        "Falls weitere Werkzeuge wirklich notwendig sind, rufe nur neue Werkzeuge auf. " +
-        "Andernfalls gib jetzt die endgültige Antwort."
+        resultText +
+        "\n\nNutze ausschließlich die tatsächlich gemeldeten Ergebnisse. " +
+        "Bereits erfolgreich ausgeführte Werkzeugaufrufe dürfen nicht " +
+        "wiederholt werden. Falls weitere Werkzeuge wirklich notwendig sind, " +
+        "rufe nur neue Werkzeuge auf. " +
+        "Andernfalls gib jetzt die endgültige Antwort. " +
+        "Behaupte niemals eine Änderung oder ein Deployment als erfolgreich, " +
+        "wenn das Werkzeug keinen tatsächlichen Erfolg bestätigt."
     });
+
+    shrinkWorkingContext();
   }
 
   const finalResponse = await env.AI.run(MODEL, {
     messages: [
-      ...messages,
+      {
+        role: "system",
+        content: SYSTEM
+      },
+      ...messages
+        .filter(message => message.role !== "system")
+        .slice(-6)
+        .map(message => ({
+          role: message.role,
+          content: clip(message.content)
+        })),
       {
         role: "system",
         content:
-          "Das Werkzeuglimit wurde erreicht. " +
-          "Rufe keine weiteren Werkzeuge auf. " +
-          "Fasse die vorhandenen Werkzeugergebnisse korrekt zusammen " +
-          "und behaupte keine nicht bestätigten Schritte."
+          "Das Werkzeuglimit dieser einzelnen Arbeitsrunde wurde erreicht. " +
+          "Fasse die vorhandenen Ergebnisse korrekt zusammen. " +
+          "Behaupte keine nicht bestätigten Schritte."
       }
     ],
     max_tokens: 2048
@@ -1235,43 +1400,77 @@ async function askEO(env, incomingMessages) {
   return {
     reply:
       getText(finalResponse) ||
-      "EO hat das Werkzeuglimit erreicht. Nicht bestätigte Schritte gelten nicht als erledigt.",
+      "EO hat das Werkzeuglimit dieser Arbeitsrunde erreicht.",
     tools: audit
   };
-  }
+}
+
 function isTextLike(type, name) {
   const t = (type || "").toLowerCase();
   const n = (name || "").toLowerCase();
+
   return t.startsWith("text/") ||
-    ["application/json", "application/xml", "application/javascript"].includes(t) ||
+    [
+      "application/json",
+      "application/xml",
+      "application/javascript"
+    ].includes(t) ||
     /\.(txt|md|csv|json|js|mjs|cjs|ts|tsx|jsx|html|htm|css|xml|yml|yaml|py|java|c|cpp|h|hpp|go|rs|php|sql|log)$/i.test(n);
 }
 
 async function handleUpload(request, env) {
-  if (!env.DB) return json({ ok: false, error: "D1-Bindung DB fehlt." }, 500);
+  if (!env.DB) {
+    return json({
+      ok: false,
+      error: "D1-Bindung DB fehlt."
+    }, 500);
+  }
+
   await ensureSchema(env);
 
   const form = await request.formData();
   const file = form.get("file");
-  const project = cleanProject(form.get("project") || "Uploads");
+  const project = cleanProject(
+    form.get("project") || "Uploads"
+  );
 
-  if (!(file instanceof File)) return json({ ok: false, error: "Keine Datei empfangen." }, 400);
-  if (!file.name) return json({ ok: false, error: "Dateiname fehlt." }, 400);
+  if (!(file instanceof File)) {
+    return json({
+      ok: false,
+      error: "Keine Datei empfangen."
+    }, 400);
+  }
 
-  const contentType = file.type || "application/octet-stream";
-  const objectKey = `${Date.now()}-${crypto.randomUUID()}-${file.name.replace(/[^a-zA-Z0-9._-]/g, "_")}`;
+  if (!file.name) {
+    return json({
+      ok: false,
+      error: "Dateiname fehlt."
+    }, 400);
+  }
 
-  // Text/Code bis 500 KB kann sofort als EO-Projektdatei in D1 gespeichert werden.
-  if (isTextLike(contentType, file.name) && file.size <= 500000) {
+  const contentType =
+    file.type || "application/octet-stream";
+
+  const objectKey =
+    `${Date.now()}-${crypto.randomUUID()}-` +
+    file.name.replace(
+      /[^a-zA-Z0-9._-]/g,
+      "_"
+    );
+
+  if (
+    isTextLike(contentType, file.name) &&
+    file.size <= 500000
+  ) {
     const text = await file.text();
+
     const saved = await saveFile(env, {
       project,
       path: file.name,
       content: text,
       language: contentType
     });
-
-    if (!saved.ok) return json({ ok: false, error: "Textdatei konnte nicht verifiziert gespeichert werden.", saved }, 500);
+      if (!saved.ok) return json({ ok: false, error: "Textdatei konnte nicht verifiziert gespeichert werden.", saved }, 500);
 
     await env.DB.prepare(`
       INSERT INTO uploads(object_key, file_name, content_type, bytes, storage, project_name)
