@@ -783,15 +783,16 @@ case "read_self_code": {
     };
   }
 
-  const response = await fetch(
-    `https://api.cloudflare.com/client/v4/accounts/${env.CF_ACCOUNT_ID}/workers/scripts/${env.CF_WORKER_NAME}/content/v2`,
-    {
-      method: "GET",
-      headers: {
-        Authorization: `Bearer ${env.CF_API_TOKEN}`
-      }
+  const base =
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(env.CF_ACCOUNT_ID)}` +
+    `/workers/scripts/${encodeURIComponent(env.CF_WORKER_NAME)}`;
+
+  const response = await fetch(base + "/content/v2", {
+    method: "GET",
+    headers: {
+      Authorization: `Bearer ${env.CF_API_TOKEN}`
     }
-  );
+  });
 
   if (!response.ok) {
     return {
@@ -802,108 +803,417 @@ case "read_self_code": {
     };
   }
 
-  const code = await response.text();
+  const contentType = response.headers.get("content-type") || "";
+  const raw = await response.text();
+
+  let code = raw;
+  let extracted = false;
+
+  if (/multipart\/form-data/i.test(contentType)) {
+    const boundaryMatch = contentType.match(/boundary="?([^";]+)"?/i);
+
+    if (!boundaryMatch) {
+      return {
+        ok: false,
+        tool: name,
+        error: "Cloudflare lieferte Multipart-Daten ohne erkennbare Boundary."
+      };
+    }
+
+    const boundary = boundaryMatch[1];
+    const parts = raw.split(`--${boundary}`);
+    let mainModule = "";
+
+    for (const part of parts) {
+      if (!/content-disposition:/i.test(part)) continue;
+
+      const filenameMatch = part.match(/filename="([^"]+)"/i);
+      if (!filenameMatch) continue;
+
+      const filename = filenameMatch[1];
+
+      if (
+        filename === "eo-worker.js" ||
+        filename === "worker.js" ||
+        filename.endsWith(".mjs") ||
+        filename.endsWith(".js")
+      ) {
+        const splitIndex = part.indexOf("\r\n\r\n");
+
+        if (splitIndex !== -1) {
+          const body = part
+            .slice(splitIndex + 4)
+            .replace(/\r\n$/, "")
+            .trim();
+
+          if (
+            body.includes("export default") ||
+            body.includes("async fetch") ||
+            body.includes("fetch(request")
+          ) {
+            mainModule = body;
+            break;
+          }
+        }
+      }
+    }
+
+    if (!mainModule) {
+      return {
+        ok: false,
+        tool: name,
+        error: "Worker-Hauptmodul konnte nicht aus der Multipart-Antwort extrahiert werden."
+      };
+    }
+
+    code = mainModule;
+    extracted = true;
+  }
+
+  if (!code || code.length < 1000) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Zurückgelesener Worker-Code ist leer oder unvollständig."
+    };
+  }
 
   return {
     ok: true,
     tool: name,
     worker: env.CF_WORKER_NAME,
-    bytes: code.length,
+    bytes: new TextEncoder().encode(code).length,
     sha256: await textSha256(code),
+    extracted_from_multipart: extracted,
     code
   };
-      }
-    case "prepare_self_update": {
-      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
-      const code = safeText(args.code, 950000);
-      if (!code.includes("export default") || !code.includes("async fetch"))
-        return { ok: false, tool: name, error: "Update-Kandidat sieht nicht wie ein vollständiger ES-Module-Worker aus." };
-      const hash = await textSha256(code);
-      const result = await env.DB.prepare(`
-        INSERT INTO eo_updates(code, note, sha256, status)
-        VALUES(?, ?, ?, 'prepared')
-      `).bind(code, safeText(args.note, 2000), hash).run();
-      return { ok: !!result.success, tool: name, sha256: hash, bytes: new TextEncoder().encode(code).length, status: "prepared" };
-    }
-
-    case "self_update_status": {
-      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
-      const candidate = await env.DB.prepare(`
-        SELECT id, note, sha256, status, created_at, deployed_at, length(code) AS characters
-        FROM eo_updates ORDER BY id DESC LIMIT 1
-      `).first();
-      return {
-        ok: true,
-        tool: name,
-        candidate: candidate || null,
-        deployment_ready: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_WORKER_NAME),
-        required_secrets: {
-          CF_API_TOKEN: !!env.CF_API_TOKEN,
-          CF_ACCOUNT_ID: !!env.CF_ACCOUNT_ID,
-          CF_WORKER_NAME: !!env.CF_WORKER_NAME
         }
-      };
+      case "prepare_self_update": {
+  if (!env.DB) {
+    return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+  }
+
+  const code = safeText(args.code, 950000);
+
+  if (!code || code.length < 1000) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Update-Kandidat ist leer oder offensichtlich unvollständig."
+    };
+  }
+
+  const looksLikeWorker =
+    code.includes("export default") ||
+    code.includes("async fetch") ||
+    code.includes("fetch(request") ||
+    code.includes('addEventListener("fetch"') ||
+    code.includes("addEventListener('fetch'");
+
+  if (!looksLikeWorker) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Update-Kandidat sieht nicht wie ein vollständiger Cloudflare Worker aus."
+    };
+  }
+
+  const hash = await textSha256(code);
+
+  const result = await env.DB.prepare(`
+    INSERT INTO eo_updates(code, note, sha256, status)
+    VALUES(?, ?, ?, 'prepared')
+  `).bind(code, safeText(args.note, 2000), hash).run();
+
+  return {
+    ok: !!result.success,
+    tool: name,
+    sha256: hash,
+    bytes: new TextEncoder().encode(code).length,
+    status: "prepared"
+  };
+}
+
+case "self_update_status": {
+  if (!env.DB) {
+    return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+  }
+
+  const candidate = await env.DB.prepare(`
+    SELECT id, note, sha256, status, created_at, deployed_at,
+           length(code) AS characters
+    FROM eo_updates
+    ORDER BY id DESC
+    LIMIT 1
+  `).first();
+
+  return {
+    ok: true,
+    tool: name,
+    candidate: candidate || null,
+    deployment_ready: !!(
+      env.CF_API_TOKEN &&
+      env.CF_ACCOUNT_ID &&
+      env.CF_WORKER_NAME
+    ),
+    required_secrets: {
+      CF_API_TOKEN: !!env.CF_API_TOKEN,
+      CF_ACCOUNT_ID: !!env.CF_ACCOUNT_ID,
+      CF_WORKER_NAME: !!env.CF_WORKER_NAME
     }
+  };
+}
 
-    case "deploy_self": {
-      if (String(args.confirm || "") !== "DEPLOY EO")
-        return { ok: false, tool: name, error: "Bestätigung DEPLOY EO fehlt." };
-      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
-      if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_WORKER_NAME)
-        return { ok: false, tool: name, error: "CF_API_TOKEN, CF_ACCOUNT_ID oder CF_WORKER_NAME fehlt als Secret/Variable." };
+case "deploy_self": {
+  if (String(args.confirm || "") !== "DEPLOY EO") {
+    return {
+      ok: false,
+      tool: name,
+      error: "Bestätigung DEPLOY EO fehlt."
+    };
+  }
 
-      const candidate = await env.DB.prepare(`
-        SELECT id, code, sha256 FROM eo_updates
-        WHERE status='prepared' ORDER BY id DESC LIMIT 1
-      `).first();
-      if (!candidate) return { ok: false, tool: name, error: "Kein vorbereiteter Update-Kandidat vorhanden." };
+  if (!env.DB) {
+    return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+  }
 
-      const base = `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(env.CF_ACCOUNT_ID)}/workers/scripts/${encodeURIComponent(env.CF_WORKER_NAME)}`;
-      const auth = { Authorization: `Bearer ${env.CF_API_TOKEN}` };
+  if (!env.CF_API_TOKEN || !env.CF_ACCOUNT_ID || !env.CF_WORKER_NAME) {
+    return {
+      ok: false,
+      tool: name,
+      error: "CF_API_TOKEN, CF_ACCOUNT_ID oder CF_WORKER_NAME fehlt."
+    };
+  }
 
-      // Aktuelle Settings abrufen, damit bestehende Bindings beim Upload erhalten bleiben.
-      const settingsResponse = await fetch(base + "/settings", { headers: auth });
-      const settingsJson = await settingsResponse.json().catch(() => null);
-      if (!settingsResponse.ok || !settingsJson?.success) {
-        return { ok: false, tool: name, error: "Aktuelle Worker-Settings konnten nicht gelesen werden; Deployment abgebrochen, damit Bindings nicht verloren gehen.", details: settingsJson };
-      }
+  const candidate = await env.DB.prepare(`
+    SELECT id, code, sha256
+    FROM eo_updates
+    WHERE status='prepared'
+    ORDER BY id DESC
+    LIMIT 1
+  `).first();
 
-      const s = settingsJson.result || {};
-      const metadata = {
-        main_module: "eo-worker.js",
-        compatibility_date: s.compatibility_date || "2026-08-12",
-        bindings: Array.isArray(s.bindings) ? s.bindings : [],
-        keep_assets: true,
-        annotations: { "workers/message": "EO self-update" }
-      };
+  if (!candidate) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Kein vorbereiteter Update-Kandidat vorhanden."
+    };
+  }
 
-      const form = new FormData();
-      form.set("metadata", new Blob([JSON.stringify(metadata)], { type: "application/json" }));
-      form.set("eo-worker.js", new Blob([candidate.code], { type: "application/javascript+module" }), "eo-worker.js");
+  const base =
+    `https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(env.CF_ACCOUNT_ID)}` +
+    `/workers/scripts/${encodeURIComponent(env.CF_WORKER_NAME)}`;
 
-      const deployResponse = await fetch(base, {
-        method: "PUT",
-        headers: auth,
-        body: form
-      });
-      const deployJson = await deployResponse.json().catch(() => null);
-      if (!deployResponse.ok || !deployJson?.success) {
-        return { ok: false, tool: name, error: "Cloudflare-Deployment fehlgeschlagen.", details: deployJson };
-      }
+  const auth = {
+    Authorization: `Bearer ${env.CF_API_TOKEN}`
+  };
 
-      await env.DB.prepare(`
-        UPDATE eo_updates SET status='deployed', deployed_at=CURRENT_TIMESTAMP WHERE id=?
-      `).bind(candidate.id).run();
+  // Aktuelle Version vor dem Upload merken.
+  const beforeResponse = await fetch(base + "/versions?per_page=5", {
+    headers: auth
+  });
 
-      return {
-        ok: true,
-        tool: name,
-        sha256: candidate.sha256,
-        status: "deployed",
-        cloudflare: deployJson.result || true
-      };
+  const beforeJson = await beforeResponse.json().catch(() => null);
+
+  if (!beforeResponse.ok || !beforeJson?.success) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Cloudflare-Versionen konnten vor dem Deployment nicht gelesen werden.",
+      details: beforeJson
+    };
+  }
+
+  const oldVersionId =
+    Array.isArray(beforeJson.result) && beforeJson.result.length
+      ? beforeJson.result[0]?.id || null
+      : null;
+
+  // Bestehende Worker-Settings lesen, damit Bindings erhalten bleiben.
+  const settingsResponse = await fetch(base + "/settings", {
+    headers: auth
+  });
+
+  const settingsJson = await settingsResponse.json().catch(() => null);
+
+  if (!settingsResponse.ok || !settingsJson?.success) {
+    return {
+      ok: false,
+      tool: name,
+      error:
+        "Worker-Settings konnten nicht gelesen werden. Deployment wurde abgebrochen.",
+      details: settingsJson
+    };
+  }
+
+  const s = settingsJson.result || {};
+
+  const metadata = {
+    main_module: "eo-worker.js",
+    compatibility_date: s.compatibility_date || "2026-08-12",
+    bindings: Array.isArray(s.bindings) ? s.bindings : [],
+    keep_assets: true,
+    annotations: {
+      "workers/message": "EO self-update"
     }
+  };
 
+  const form = new FormData();
+
+  form.set(
+    "metadata",
+    new Blob(
+      [JSON.stringify(metadata)],
+      { type: "application/json" }
+    )
+  );
+
+  form.set(
+    "eo-worker.js",
+    new Blob(
+      [candidate.code],
+      { type: "application/javascript+module" }
+    ),
+    "eo-worker.js"
+  );
+
+  // Worker hochladen.
+  const uploadResponse = await fetch(base, {
+    method: "PUT",
+    headers: auth,
+    body: form
+  });
+
+  const uploadJson = await uploadResponse.json().catch(() => null);
+
+  if (!uploadResponse.ok || !uploadJson?.success) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Cloudflare-Worker-Upload fehlgeschlagen.",
+      details: uploadJson
+    };
+  }
+
+  // Upload ist noch NICHT gleichbedeutend mit verifiziertem Deployment.
+  await env.DB.prepare(`
+    UPDATE eo_updates
+    SET status='uploaded'
+    WHERE id=?
+  `).bind(candidate.id).run();
+
+  // Prüfen, ob Cloudflare tatsächlich eine neue Version erzeugt hat.
+  const versionsResponse = await fetch(base + "/versions?per_page=5", {
+    headers: auth
+  });
+
+  const versionsJson = await versionsResponse.json().catch(() => null);
+
+  if (!versionsResponse.ok || !versionsJson?.success) {
+    return {
+      ok: false,
+      tool: name,
+      status: "uploaded_not_verified",
+      error:
+        "Upload erfolgreich, aber die Worker-Version konnte nicht verifiziert werden."
+    };
+  }
+
+  const newVersion =
+    Array.isArray(versionsJson.result) && versionsJson.result.length
+      ? versionsJson.result[0]
+      : null;
+
+  if (!newVersion?.id) {
+    return {
+      ok: false,
+      tool: name,
+      status: "uploaded_not_verified",
+      error: "Cloudflare meldet nach dem Upload keine Worker-Version."
+    };
+  }
+
+  if (oldVersionId && newVersion.id === oldVersionId) {
+    return {
+      ok: false,
+      tool: name,
+      status: "uploaded_no_new_version",
+      version_id: newVersion.id,
+      error:
+        "Upload wurde angenommen, aber Cloudflare zeigt keine neue Version."
+    };
+  }
+
+  // Aktives Deployment unabhängig vom
+  // aktiven Deployment-Status prüfen.
+const deploymentsResponse = await fetch(base + "/deployments", {
+  headers: auth
+});
+
+const deploymentsJson =
+  await deploymentsResponse.json().catch(() => null);
+
+if (!deploymentsResponse.ok || !deploymentsJson?.success) {
+  return {
+    ok: false,
+    tool: name,
+    status: "version_created_not_verified",
+    version_id: newVersion.id,
+    error:
+      "Neue Version existiert, aber das aktive Deployment konnte nicht geprüft werden.",
+    details: deploymentsJson
+  };
+}
+
+const deployments = Array.isArray(deploymentsJson.result)
+  ? deploymentsJson.result
+  : [];
+
+const activeDeployment = deployments[0] || null;
+
+const deploymentVersions =
+  Array.isArray(activeDeployment?.versions)
+    ? activeDeployment.versions
+    : [];
+
+const activeVersion = deploymentVersions.find(
+  v => v?.version_id === newVersion.id
+);
+
+const traffic = Number(activeVersion?.percentage || 0);
+
+if (!activeVersion || traffic !== 100) {
+  return {
+    ok: false,
+    tool: name,
+    status: "version_not_active",
+    version_id: newVersion.id,
+    deployment_id: activeDeployment?.id || null,
+    traffic,
+    error:
+      "Neue Version existiert, ist aber nicht mit 100 % Traffic aktiv."
+  };
+}
+
+await env.DB.prepare(`
+  UPDATE eo_updates
+  SET status='deployed',
+      deployed_at=CURRENT_TIMESTAMP
+  WHERE id=?
+`).bind(candidate.id).run();
+
+return {
+  ok: true,
+  tool: name,
+  sha256: candidate.sha256,
+  status: "deployed",
+  verified: true,
+  version_id: newVersion.id,
+  deployment_id: activeDeployment?.id || null,
+  traffic
+};
+}
     case "clear_history": {
       if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       if (String(args.confirm || "") !== "CLEAR HISTORY")
