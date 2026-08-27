@@ -1,3 +1,4 @@
+// Cloudflare deploy trigger
 // ===== EO BLOCK 1/10 =====
 const MODEL = "@cf/meta/llama-3.3-70b-instruct-fp8-fast";
 
