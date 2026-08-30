@@ -2392,6 +2392,58 @@ loadStatus();
 </html>
 `;
 
+async function runScheduledJob(env) {
+  if (String(env.AUTO_JOBS || "").toLowerCase() !== "true") {
+    return { ok: false, skipped: "AUTO_JOBS ist nicht aktiviert." };
+  }
+  if (!env.DB || (!env.AI && !fallbackAIConfigured(env))) {
+    return { ok: false, skipped: "DB oder KI ist nicht verfügbar." };
+  }
+
+  await ensureSchema(env);
+  const job = await env.DB.prepare(`
+    SELECT * FROM jobs
+    WHERE status IN ('queued', 'running') AND attempts < 50
+    ORDER BY updated_at ASC
+    LIMIT 1
+  `).first();
+  if (!job) return { ok: true, idle: true };
+
+  await env.DB.prepare(`
+    UPDATE jobs SET status='running', attempts=attempts+1,
+      updated_at=CURRENT_TIMESTAMP WHERE id=?
+  `).bind(job.id).run();
+
+  try {
+    const result = await askEO(env, [{
+      role: "user",
+      content:
+        `AUTOMATISCHER AUFTRAG #${job.id}\n` +
+        `Ziel: ${job.goal}\n` +
+        `Letzter Checkpoint: ${job.checkpoint || "noch keiner"}\n` +
+        `Nächster Schritt: ${job.next_step || "bestimme den kleinsten nächsten Schritt"}\n\n` +
+        "Führe genau einen kleinen, sicher prüfbaren Schritt mit vorhandenen Werkzeugen aus. " +
+        "Aktualisiere danach denselben Auftrag mit update_job: Checkpoint, next_step und passendem Status. " +
+        "Behaupte keine nicht bestätigten Ergebnisse."
+    }]);
+
+    const current = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(job.id).first();
+    if (current?.status === "running") {
+      await env.DB.prepare(`
+        UPDATE jobs SET status='queued', checkpoint=?,
+          updated_at=CURRENT_TIMESTAMP WHERE id=?
+      `).bind(safeText(result?.reply, 20000), job.id).run();
+    }
+    return { ok: true, job_id: job.id };
+  } catch (error) {
+    await env.DB.prepare(`
+      UPDATE jobs SET status='failed', last_error=?,
+        updated_at=CURRENT_TIMESTAMP WHERE id=?
+    `).bind(safeText(error?.message || String(error), 5000), job.id).run();
+    return { ok: false, job_id: job.id, error: error?.message || String(error) };
+  }
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -2458,6 +2510,10 @@ export default {
     } catch (error) {
       return json({ error: error?.message || String(error) }, 500);
     }
+  },
+
+  async scheduled(controller, env, ctx) {
+    ctx.waitUntil(runScheduledJob(env));
   }
 };
 // ===== ENDE BLOCK 10/10 =====
@@ -2474,7 +2530,7 @@ TOOLS.push(...WEB_TOOLS);
 const EO_RUN_TOOL_ORIGINAL = runTool;
 
 // Web-Werkzeuge zusätzlich ausführbar machen.
-runTool = async function (env, requestedName, args = {}) {
+runTool = async function (env, requestedName, args = {}, context = {}) {
   const name = canonicalToolName(requestedName);
 
   // Neues Web-Modul verwenden.
@@ -2493,7 +2549,7 @@ runTool = async function (env, requestedName, args = {}) {
   }
 
   // Alle bisherigen EO-Werkzeuge unverändert weiterverwenden.
-  return await EO_RUN_TOOL_ORIGINAL(env, requestedName, args);
+  return await EO_RUN_TOOL_ORIGINAL(env, requestedName, args, context);
 };
 
 // ============================================================
