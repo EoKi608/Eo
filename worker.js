@@ -482,7 +482,7 @@ function publicHttpsUrl(value) {
 }
 
 // ===== ENDE BLOCK 4/10 =====// ===== EO BLOCK 5/10 =====
-async function runTool(env, requestedName, args) {
+async function runTool(env, requestedName, args, context = {}) {
   const name = canonicalToolName(requestedName);
 
   switch (name) {
@@ -966,6 +966,14 @@ case "self_update_status": {
 }
 
 case "deploy_self": {
+  if (!context.deployAuthorized) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Deployment blockiert: Der aktuelle Benutzertext muss die exakte Freigabe DEPLOY EO enthalten."
+    };
+  }
+
   if (String(args.confirm || "") !== "DEPLOY EO") {
     return {
       ok: false,
@@ -999,6 +1007,25 @@ case "deploy_self": {
       ok: false,
       tool: name,
       error: "Kein vorbereiteter Update-Kandidat vorhanden."
+    };
+  }
+
+  const candidateCode = String(candidate.code || "");
+  const candidateHash = await textSha256(candidateCode);
+  const validCandidate =
+    candidateCode.length >= 1000 &&
+    (
+      candidateCode.includes("export default") ||
+      candidateCode.includes("async fetch") ||
+      candidateCode.includes("fetch(request")
+    ) &&
+    candidateHash === candidate.sha256;
+
+  if (!validCandidate) {
+    return {
+      ok: false,
+      tool: name,
+      error: "Vorbereiteter Update-Kandidat ist unvollständig oder die Prüfsumme stimmt nicht. Deployment wurde sicher abgebrochen."
     };
   }
 
@@ -1049,11 +1076,18 @@ case "deploy_self": {
   }
 
   const s = settingsJson.result || {};
+  const preservedBindingTypes = [
+    ...new Set(
+      (Array.isArray(s.bindings) ? s.bindings : [])
+        .map(binding => String(binding?.type || "").trim())
+        .filter(Boolean)
+    )
+  ];
 
   const metadata = {
     main_module: "eo-worker.js",
     compatibility_date: s.compatibility_date || "2026-08-12",
-    bindings: Array.isArray(s.bindings) ? s.bindings : [],
+    keep_bindings: preservedBindingTypes,
     keep_assets: true,
     annotations: {
       "workers/message": "EO self-update"
@@ -1371,6 +1405,10 @@ async function runAIRouted(env, payload) {
 async function askEO(env, incomingMessages) {
   const audit = [];
   const MAX_ROUNDS = 8;
+  const latestUserText = [...(Array.isArray(incomingMessages) ? incomingMessages : [])]
+    .reverse()
+    .find(message => message?.role === "user")?.content || "";
+  const deployAuthorized = /(^|\s)DEPLOY EO(\s|$)/.test(String(latestUserText));
 
   // ============================================================
   // KONTEXTSCHUTZ GEGEN CLOUDFLARE 8007
@@ -1738,7 +1776,8 @@ async function askEO(env, incomingMessages) {
         result = await runTool(
           env,
           call.name,
-          call.arguments
+          call.arguments,
+          { deployAuthorized }
         );
       } catch (error) {
         result = {
