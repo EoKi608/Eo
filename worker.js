@@ -2235,6 +2235,11 @@ export default {
           db,
           media: !!env.MEDIA,
           self_update: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_WORKER_NAME),
+          self_update_config: {
+            CF_API_TOKEN: !!env.CF_API_TOKEN,
+            CF_ACCOUNT_ID: !!env.CF_ACCOUNT_ID,
+            CF_WORKER_NAME: !!env.CF_WORKER_NAME
+          },
           model: MODEL
         });
       }
