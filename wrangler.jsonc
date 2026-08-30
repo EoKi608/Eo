@@ -5,11 +5,7 @@
 
   "vars": {
     "CF_WORKER_NAME": "eo",
-    "AUTO_JOBS": "true"
-  },
-
-  "triggers": {
-    "crons": ["*/15 * * * *"]
+    "AUTO_JOBS": "false"
   },
 
   "ai": {
