@@ -20,6 +20,9 @@ VERBINDLICHE REGELN:
 - Antworte standardmäßig auf Deutsch.
 - Fasse Werkzeugergebnisse kurz und verständlich zusammen. Gib keine langen Roh-JSON-Blöcke aus, außer der Benutzer verlangt sie ausdrücklich.
 - Verwende vorhandene Werkzeuge selbstständig, wenn sie zur Erledigung des Auftrags nötig sind.
+- Erstelle für längere oder mehrstufige Aufgaben zuerst einen dauerhaften Auftrag mit create_job.
+- Aktualisiere nach jedem nachweislich erledigten Teilschritt Checkpoint und next_step mit update_job.
+- Setze unterbrochene Aufgaben über resume_job am gespeicherten Checkpoint fort; wiederhole keine bereits bestätigten Schritte.
 - Änderungen an EOs eigenem Worker dürfen nur über prepare_self_update und deploy_self erfolgen.
 - deploy_self darf nur nach einem ausdrücklichen Benutzerbefehl zum Installieren/Deployen/Aktualisieren ausgeführt werden.
 `;
@@ -300,6 +303,61 @@ const TOOLS = [
     }
   },
   {
+    name: "create_job",
+    description: "Erstellt einen dauerhaften Auftrag mit Ziel, Projekt und erstem nächsten Schritt.",
+    parameters: {
+      type: "object",
+      properties: {
+        title: { type: "string" },
+        goal: { type: "string" },
+        project: { type: "string" },
+        next_step: { type: "string" }
+      },
+      required: ["title", "goal"]
+    }
+  },
+  {
+    name: "update_job",
+    description: "Speichert Status, Checkpoint, nächsten Schritt oder Fehler eines dauerhaften Auftrags.",
+    parameters: {
+      type: "object",
+      properties: {
+        id: { type: "integer" },
+        status: { type: "string" },
+        checkpoint: { type: "string" },
+        next_step: { type: "string" },
+        last_error: { type: "string" }
+      },
+      required: ["id"]
+    }
+  },
+  {
+    name: "get_job",
+    description: "Liest einen dauerhaften Auftrag mit seinem letzten Checkpoint.",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "integer" } },
+      required: ["id"]
+    }
+  },
+  {
+    name: "list_jobs",
+    description: "Listet dauerhafte Aufträge, optional gefiltert nach Status.",
+    parameters: {
+      type: "object",
+      properties: { status: { type: "string" } }
+    }
+  },
+  {
+    name: "resume_job",
+    description: "Setzt einen pausierten oder fehlgeschlagenen Auftrag auf laufend und liefert Checkpoint sowie nächsten Schritt.",
+    parameters: {
+      type: "object",
+      properties: { id: { type: "integer" } },
+      required: ["id"]
+    }
+  },
+  {
     name: "inspect_log",
     description: "Untersucht bereitgestellte Log- oder Textdaten defensiv auf IPs, URLs und Fehlerindikatoren.",
     parameters: {
@@ -414,6 +472,22 @@ async function ensureSchema(env) {
         status TEXT DEFAULT 'prepared',
         created_at TEXT DEFAULT CURRENT_TIMESTAMP,
         deployed_at TEXT
+      )
+    `),
+    env.DB.prepare(`
+      CREATE TABLE IF NOT EXISTS jobs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        title TEXT NOT NULL,
+        goal TEXT NOT NULL,
+        project_name TEXT DEFAULT 'EO',
+        status TEXT DEFAULT 'queued',
+        checkpoint TEXT DEFAULT '',
+        next_step TEXT DEFAULT '',
+        last_error TEXT DEFAULT '',
+        attempts INTEGER DEFAULT 0,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        updated_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        completed_at TEXT
       )
     `)
   ]);
@@ -1249,6 +1323,74 @@ return {
   traffic
 };
 }
+    case "create_job": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const title = safeText(args.title, 300).trim();
+      const goal = safeText(args.goal, 10000).trim();
+      const project = cleanProject(args.project || "EO");
+      if (!title || !goal) return { ok: false, tool: name, error: "Titel und Ziel sind erforderlich." };
+      const result = await env.DB.prepare(`
+        INSERT INTO jobs(title, goal, project_name, status, next_step)
+        VALUES(?, ?, ?, 'queued', ?)
+      `).bind(title, goal, project, safeText(args.next_step, 5000)).run();
+      const job = await env.DB.prepare(`
+        SELECT * FROM jobs WHERE id=?
+      `).bind(result.meta?.last_row_id).first();
+      return { ok: !!job, tool: name, job };
+    }
+
+    case "update_job": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const id = Number(args.id);
+      const allowedStatuses = new Set(["queued", "running", "paused", "blocked", "failed", "completed", "cancelled"]);
+      const current = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first();
+      if (!current) return { ok: false, tool: name, error: "Auftrag nicht gefunden." };
+      const status = args.status == null ? current.status : String(args.status);
+      if (!allowedStatuses.has(status)) return { ok: false, tool: name, error: "Ungültiger Auftragsstatus." };
+      const checkpoint = args.checkpoint == null ? current.checkpoint : safeText(args.checkpoint, 20000);
+      const nextStep = args.next_step == null ? current.next_step : safeText(args.next_step, 5000);
+      const lastError = args.last_error == null ? current.last_error : safeText(args.last_error, 5000);
+      await env.DB.prepare(`
+        UPDATE jobs SET status=?, checkpoint=?, next_step=?, last_error=?,
+          attempts=attempts+1, updated_at=CURRENT_TIMESTAMP,
+          completed_at=CASE WHEN ?='completed' THEN CURRENT_TIMESTAMP ELSE completed_at END
+        WHERE id=?
+      `).bind(status, checkpoint, nextStep, lastError, status, id).run();
+      const job = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first();
+      return { ok: true, tool: name, job };
+    }
+
+    case "get_job": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const job = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(Number(args.id)).first();
+      return job ? { ok: true, tool: name, job } : { ok: false, tool: name, error: "Auftrag nicht gefunden." };
+    }
+
+    case "list_jobs": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const status = safeText(args.status, 40).trim();
+      const result = status
+        ? await env.DB.prepare("SELECT * FROM jobs WHERE status=? ORDER BY updated_at DESC LIMIT 50").bind(status).all()
+        : await env.DB.prepare("SELECT * FROM jobs ORDER BY updated_at DESC LIMIT 50").all();
+      return { ok: true, tool: name, jobs: result.results || [] };
+    }
+
+    case "resume_job": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const id = Number(args.id);
+      const current = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first();
+      if (!current) return { ok: false, tool: name, error: "Auftrag nicht gefunden." };
+      if (["completed", "cancelled"].includes(current.status)) {
+        return { ok: false, tool: name, error: "Abgeschlossener oder abgebrochener Auftrag kann nicht fortgesetzt werden." };
+      }
+      await env.DB.prepare(`
+        UPDATE jobs SET status='running', attempts=attempts+1,
+          last_error='', updated_at=CURRENT_TIMESTAMP WHERE id=?
+      `).bind(id).run();
+      const job = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first();
+      return { ok: true, tool: name, job, instruction: "Setze exakt beim gespeicherten next_step fort und aktualisiere danach den Checkpoint." };
+    }
+
     case "clear_history": {
       if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       if (String(args.confirm || "") !== "CLEAR HISTORY")
