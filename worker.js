@@ -358,6 +358,24 @@ const TOOLS = [
     }
   },
   {
+    name: "publish_project",
+    description: "Veröffentlicht ein gespeichertes HTML/CSS/JS-Projekt über EOs öffentliche App-URL, nachdem index.html und Projektstruktur geprüft wurden.",
+    parameters: {
+      type: "object",
+      properties: { project: { type: "string" } },
+      required: ["project"]
+    }
+  },
+  {
+    name: "test_published_project",
+    description: "Ruft die veröffentlichte index.html eines Projekts real über HTTPS ab und prüft Status sowie Grundstruktur.",
+    parameters: {
+      type: "object",
+      properties: { project: { type: "string" } },
+      required: ["project"]
+    }
+  },
+  {
     name: "inspect_log",
     description: "Untersucht bereitgestellte Log- oder Textdaten defensiv auf IPs, URLs und Fehlerindikatoren.",
     parameters: {
@@ -553,6 +571,20 @@ function publicHttpsUrl(value) {
     /^169\.254\./.test(h) || /^172\.(1[6-9]|2\d|3[01])\./.test(h)
   ) return null;
   return u;
+}
+
+function projectContentType(path) {
+  const ext = String(path || "").toLowerCase().split(".").pop();
+  return ({
+    html: "text/html; charset=UTF-8",
+    htm: "text/html; charset=UTF-8",
+    css: "text/css; charset=UTF-8",
+    js: "application/javascript; charset=UTF-8",
+    mjs: "application/javascript; charset=UTF-8",
+    json: "application/json; charset=UTF-8",
+    txt: "text/plain; charset=UTF-8",
+    svg: "image/svg+xml"
+  })[ext] || "text/plain; charset=UTF-8";
 }
 
 // ===== ENDE BLOCK 4/10 =====// ===== EO BLOCK 5/10 =====
@@ -1323,6 +1355,49 @@ return {
   traffic
 };
 }
+    case "publish_project": {
+      if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
+      const project = cleanProject(args.project);
+      const validation = await runTool(env, "validate_project", { project }, context);
+      const index = await env.DB.prepare(
+        "SELECT content FROM files WHERE project_name=? AND path='index.html'"
+      ).bind(project).first();
+      if (!index) return { ok: false, tool: name, error: "index.html fehlt.", project };
+      if (!validation.ok) return { ok: false, tool: name, error: "Projektprüfung fehlgeschlagen.", validation };
+      const base = String(env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+      if (!base.startsWith("https://")) {
+        return { ok: false, tool: name, error: "PUBLIC_BASE_URL fehlt oder ist nicht HTTPS." };
+      }
+      return {
+        ok: true,
+        tool: name,
+        project,
+        url: `${base}/apps/${encodeURIComponent(project)}/`,
+        validation
+      };
+    }
+
+    case "test_published_project": {
+      const project = cleanProject(args.project);
+      const base = String(env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+      if (!base.startsWith("https://")) {
+        return { ok: false, tool: name, error: "PUBLIC_BASE_URL fehlt oder ist nicht HTTPS." };
+      }
+      const url = `${base}/apps/${encodeURIComponent(project)}/`;
+      const response = await fetch(url, { redirect: "follow" });
+      const body = (await response.text()).slice(0, 200000);
+      return {
+        ok: response.ok && /<html[\s>]/i.test(body) && /<\/html>/i.test(body),
+        tool: name,
+        project,
+        url: response.url,
+        status: response.status,
+        bytes: new TextEncoder().encode(body).length,
+        has_html: /<html[\s>]/i.test(body),
+        has_closing_html: /<\/html>/i.test(body)
+      };
+    }
+
     case "create_job": {
       if (!env.DB) return { ok: false, tool: name, error: "D1-Bindung DB fehlt." };
       const title = safeText(args.title, 300).trim();
@@ -2497,6 +2572,38 @@ export default {
 
       if (url.pathname === "/api/uploads" && request.method === "GET") {
         return listUploads(env);
+      }
+
+      if (url.pathname.startsWith("/apps/") && request.method === "GET") {
+        if (!env.DB) return new Response("D1-Bindung DB fehlt.", { status: 500 });
+        await ensureSchema(env);
+        const parts = url.pathname.split("/").filter(Boolean);
+        if (parts.length < 2) return new Response("Projekt fehlt.", { status: 400 });
+        let project;
+        let requestedPath;
+        try {
+          project = cleanProject(decodeURIComponent(parts[1]));
+          requestedPath = parts.length > 2
+            ? cleanPath(parts.slice(2).map(decodeURIComponent).join("/"))
+            : "index.html";
+        } catch {
+          return new Response("Ungültiger Pfad.", { status: 400 });
+        }
+        if (!requestedPath || requestedPath.startsWith(".") || requestedPath.includes("../")) {
+          return new Response("Ungültiger Pfad.", { status: 400 });
+        }
+        const file = await env.DB.prepare(
+          "SELECT content FROM files WHERE project_name=? AND path=?"
+        ).bind(project, requestedPath).first();
+        if (!file) return new Response("App-Datei nicht gefunden.", { status: 404 });
+        return new Response(file.content, {
+          headers: {
+            "content-type": projectContentType(requestedPath),
+            "cache-control": "no-store",
+            "x-content-type-options": "nosniff",
+            "content-security-policy": "default-src 'self' data: blob:; connect-src 'none'; frame-ancestors 'none'; base-uri 'none'"
+          }
+        });
       }
 
       if (url.pathname === "/api/project-files" && request.method === "GET") {
