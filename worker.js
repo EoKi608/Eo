@@ -1256,6 +1256,118 @@ return {
 
 // ===== ENDE BLOCK 7/10 =====// ===== EO BLOCK 8/10 =====
 
+function aiErrorText(error) {
+  const parts = [
+    error?.message,
+    error?.error,
+    error?.cause?.message,
+    typeof error === "string" ? error : ""
+  ].filter(Boolean);
+  try { parts.push(JSON.stringify(error)); } catch {}
+  return parts.join(" ");
+}
+
+function fallbackAIConfigured(env) {
+  return !!(
+    env.AI_FALLBACK_URL &&
+    env.AI_FALLBACK_API_KEY &&
+    env.AI_FALLBACK_MODEL
+  );
+}
+
+function openAITools(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  return tools.map(tool => ({
+    type: "function",
+    function: {
+      name: tool.name,
+      description: tool.description || "",
+      parameters: tool.parameters || { type: "object", properties: {} }
+    }
+  }));
+}
+
+async function runFallbackAI(env, payload, primaryError) {
+  if (!fallbackAIConfigured(env)) {
+    const error = new Error(
+      "Primäre KI ist nicht verfügbar und der externe KI-Fallback ist nicht vollständig konfiguriert. " +
+      "Erforderlich: AI_FALLBACK_URL, AI_FALLBACK_API_KEY und AI_FALLBACK_MODEL."
+    );
+    error.cause = primaryError;
+    throw error;
+  }
+
+  let endpoint;
+  try {
+    endpoint = new URL(String(env.AI_FALLBACK_URL));
+  } catch {
+    throw new Error("AI_FALLBACK_URL ist keine gültige URL.");
+  }
+  if (endpoint.protocol !== "https:") {
+    throw new Error("AI_FALLBACK_URL muss HTTPS verwenden.");
+  }
+
+  const body = {
+    model: String(env.AI_FALLBACK_MODEL),
+    messages: payload.messages,
+    max_tokens: payload.max_tokens || 2048
+  };
+  const tools = openAITools(payload.tools);
+  if (tools?.length) {
+    body.tools = tools;
+    body.tool_choice = "auto";
+  }
+
+  const response = await fetch(endpoint.toString(), {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${env.AI_FALLBACK_API_KEY}`,
+      "content-type": "application/json"
+    },
+    body: JSON.stringify(body)
+  });
+  const data = await response.json().catch(async () => ({
+    error: { message: (await response.text().catch(() => "")).slice(0, 1000) }
+  }));
+
+  if (!response.ok) {
+    const message =
+      data?.error?.message ||
+      data?.message ||
+      `HTTP ${response.status}`;
+    throw new Error(`Externer KI-Fallback fehlgeschlagen: ${message}`);
+  }
+
+  const message = data?.choices?.[0]?.message;
+  if (!message) {
+    throw new Error("Externer KI-Fallback lieferte keine verwendbare Antwort.");
+  }
+
+  return {
+    response: typeof message.content === "string" ? message.content : "",
+    tool_calls: Array.isArray(message.tool_calls) ? message.tool_calls : [],
+    provider: "fallback"
+  };
+}
+
+async function runAIRouted(env, payload) {
+  let primaryError = null;
+
+  if (env.AI) {
+    try {
+      const result = await env.AI.run(MODEL, payload);
+      if (result) return result;
+      primaryError = new Error("Workers AI lieferte eine leere Antwort.");
+    } catch (error) {
+      primaryError = error;
+    }
+  } else {
+    primaryError = new Error("Workers-AI-Bindung AI fehlt.");
+  }
+
+  return runFallbackAI(env, payload, primaryError);
+}
+
 async function askEO(env, incomingMessages) {
   const audit = [];
   const MAX_ROUNDS = 8;
@@ -1500,7 +1612,7 @@ async function askEO(env, incomingMessages) {
       payload.tools = TOOLS;
     }
 
-    return env.AI.run(MODEL, payload);
+    return runAIRouted(env, payload);
   }
 
   const executedCalls = new Set();
@@ -1604,7 +1716,7 @@ async function askEO(env, incomingMessages) {
         }
       ];
 
-      const finalResponse = await env.AI.run(MODEL, {
+      const finalResponse = await runAIRouted(env, {
         messages: finalMessages,
         max_tokens: 2048
       });
@@ -1684,7 +1796,7 @@ async function askEO(env, incomingMessages) {
     shrinkWorkingContext();
   }
 
-  const finalResponse = await env.AI.run(MODEL, {
+  const finalResponse = await runAIRouted(env, {
     messages: [
       {
         role: "system",
@@ -2118,6 +2230,8 @@ export default {
           eo: true,
           version: "4.0",
           ai: !!env.AI,
+          ai_fallback: fallbackAIConfigured(env),
+          ai_router: true,
           db,
           media: !!env.MEDIA,
           self_update: !!(env.CF_API_TOKEN && env.CF_ACCOUNT_ID && env.CF_WORKER_NAME),
@@ -2126,7 +2240,7 @@ export default {
       }
 
       if (url.pathname === "/api/chat" && request.method === "POST") {
-        if (!env.AI) return json({ error: "Workers-AI-Bindung AI fehlt." }, 500);
+        if (!env.AI && !fallbackAIConfigured(env)) return json({ error: "Keine KI-Verbindung konfiguriert." }, 500);
         if (!env.DB) return json({ error: "D1-Bindung DB fehlt." }, 500);
 
         await ensureSchema(env);
