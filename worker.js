@@ -786,7 +786,7 @@ async function runTool(env, requestedName, args, context = {}) {
       const project = cleanProject(args.project);
       const path = cleanPath(args.path);
       const file = await env.DB.prepare(`
-        SELECT content, language, created_at, updated_at FROM files WHERE project_name=? AND path=?
+        SELECT content, language, updated_at FROM files WHERE project_name=? AND path=?
       `).bind(project, path).first();
       if (!file) return { ok: false, tool: name, error: "Datei nicht gefunden.", project, path };
       return {
@@ -794,7 +794,7 @@ async function runTool(env, requestedName, args, context = {}) {
         bytes: new TextEncoder().encode(file.content).length,
         characters: file.content.length,
         language: file.language,
-        created_at: file.created_at,
+        created_at: null,
         updated_at: file.updated_at,
         sha256: await textSha256(file.content)
       };
