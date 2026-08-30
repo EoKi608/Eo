@@ -1345,7 +1345,8 @@ return {
       const allowedStatuses = new Set(["queued", "running", "paused", "blocked", "failed", "completed", "cancelled"]);
       const current = await env.DB.prepare("SELECT * FROM jobs WHERE id=?").bind(id).first();
       if (!current) return { ok: false, tool: name, error: "Auftrag nicht gefunden." };
-      const status = args.status == null ? current.status : String(args.status);
+      const requestedStatus = args.status == null ? current.status : String(args.status);
+      const status = requestedStatus === "in_progress" ? "running" : requestedStatus;
       if (!allowedStatuses.has(status)) return { ok: false, tool: name, error: "Ungültiger Auftragsstatus." };
       const checkpoint = args.checkpoint == null ? current.checkpoint : safeText(args.checkpoint, 20000);
       const nextStep = args.next_step == null ? current.next_step : safeText(args.next_step, 5000);
