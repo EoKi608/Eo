@@ -5,7 +5,8 @@
 
   "vars": {
     "CF_WORKER_NAME": "eo",
-    "AUTO_JOBS": "false"
+    "AUTO_JOBS": "false",
+    "PUBLIC_BASE_URL": "https://eo.ichbingrud915.workers.dev"
   },
 
   "ai": {
