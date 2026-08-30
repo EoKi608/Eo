@@ -4,7 +4,12 @@
   "compatibility_date": "2026-08-11",
 
   "vars": {
-    "CF_WORKER_NAME": "eo"
+    "CF_WORKER_NAME": "eo",
+    "AUTO_JOBS": "true"
+  },
+
+  "triggers": {
+    "crons": ["*/5 * * * *"]
   },
 
   "ai": {
